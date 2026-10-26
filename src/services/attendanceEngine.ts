@@ -350,8 +350,8 @@ class AttendanceEngine {
           } else if (khairiInList) {
             khairiInList.email = 'khairi.mohd@mara.gov.my';
             khairiInList.role = this.isEmailCoAdmin('khairi.mohd@mara.gov.my') ? 'ADMIN' : 'LECTURER';
-            if (!khairiInList.pin) {
-              khairiInList.pin = DEFAULT_LECTURER_PIN;
+            if (!khairiInList.pin || khairiInList.pin === '5313') {
+              khairiInList.pin = '5305';
             }
             khairiInList.assignedSubjects = [
               'MPU2162 - PENGAJIAN MALAYSIA 2',
@@ -363,12 +363,13 @@ class AttendanceEngine {
           }
         }
 
-        // Sanitize all stored lecturers against co-admin list:
+        // Sanitize all stored lecturers against co-admin list & stale Khairi PIN:
         this.lecturers = this.lecturers.map((lec) => {
           const lEmail = (lec.email || '').toLowerCase().trim();
           if (lEmail === 'khairi.mohd@mara.gov.my' || lec.id === 'LEC-KHAIRI') {
             return {
               ...lec,
+              pin: (!lec.pin || lec.pin === '5313') ? '5305' : lec.pin,
               role: this.isEmailCoAdmin(lEmail) ? ('ADMIN' as const) : ('LECTURER' as const)
             };
           }
@@ -837,8 +838,8 @@ class AttendanceEngine {
         khairiLec.email = 'khairi.mohd@mara.gov.my';
       }
       khairiLec.role = this.isEmailCoAdmin(khairiLec.email) ? 'ADMIN' : 'LECTURER';
-      if (!khairiLec.pin) {
-        khairiLec.pin = DEFAULT_LECTURER_PIN;
+      if (!khairiLec.pin || khairiLec.pin === '5313') {
+        khairiLec.pin = '5305';
       }
     }
     // Always map known Khairi aliases to official khairi.mohd@mara.gov.my
@@ -1438,7 +1439,7 @@ class AttendanceEngine {
                 ...lec,
                 email: cleanEmail,
                 role: (isCoAdmin || (lec.role === 'ADMIN' && cleanEmail !== 'khairi.mohd@mara.gov.my')) ? ('ADMIN' as const) : ('LECTURER' as const),
-                pin: lec.pin || DEFAULT_LECTURER_PIN,
+                pin: (cleanEmail === 'khairi.mohd@mara.gov.my' && (!lec.pin || lec.pin === '5313')) ? '5305' : (lec.pin || DEFAULT_LECTURER_PIN),
                 mustChangePin: lec.mustChangePin ?? false,
                 assignedClasses: Array.from(new Set(lec.assignedClasses || [])),
                 assignedSections: Array.from(new Set(lec.assignedSections || [])),
@@ -2124,26 +2125,13 @@ class AttendanceEngine {
       role: isCoAdmin ? ('ADMIN' as const) : ('LECTURER' as const)
     };
 
-    // Master Admin PIN direct verification if entered
-    if (rawInput === '5313' && isCoAdmin) {
-      this.activeLecturer = effectiveLecturer;
-      this.saveActiveLecturerLocally();
-      return {
-        success: true,
-        lecturer: effectiveLecturer,
-        message: `Akses Pentadbir Berjaya! Selamat bertugas, ${effectiveLecturer.name}.`,
-        requirePinChange: Boolean(effectiveLecturer.mustChangePin)
-      };
-    }
-
-    // 3. Verify PIN strictly against lecturer.pin (default '1234'), or Master Admin bypass ('5313')
+    // 3. Verify PIN strictly against lecturer.pin (must match exactly)
     const expectedPin = effectiveLecturer.pin || DEFAULT_LECTURER_PIN;
     const isPinMatch = rawInput === expectedPin;
-    const isMasterBypass = rawInput === '5313';
 
-    if (isPinMatch || isMasterBypass) {
-      // Check status: if PENDING or REJECTED, block login unless admin bypass
-      if (!isMasterBypass && !isCoAdmin) {
+    if (isPinMatch) {
+      // Check status: if PENDING or REJECTED, block login unless co-admin
+      if (!isCoAdmin) {
         if (effectiveLecturer.status === 'PENDING') {
           return {
             success: false,
@@ -3139,6 +3127,10 @@ class AttendanceEngine {
           pin = existing.pin || DEFAULT_LECTURER_PIN;
           mustChangePin = false;
           pinChangedAt = existing.pinChangedAt;
+        } else if (existing.pin && existing.pin !== DEFAULT_LECTURER_PIN) {
+          pin = existing.pin;
+          mustChangePin = Boolean(existing.mustChangePin);
+          pinChangedAt = existing.pinChangedAt;
         } else {
           pin = DEFAULT_LECTURER_PIN;
           mustChangePin = true;
@@ -3149,6 +3141,14 @@ class AttendanceEngine {
         pin = DEFAULT_LECTURER_PIN;
         mustChangePin = true;
         pinChangedAt = undefined;
+      }
+
+      // Safeguard Khairi: Always default to 5305 if 5313 or unset
+      if (lecturerId === 'LEC-KHAIRI' || email === 'khairi.mohd@mara.gov.my') {
+        if (!pin || pin === '5313') {
+          pin = '5305';
+          mustChangePin = false;
+        }
       }
 
       const department = incoming.department || existing?.department || 'Jabatan Pengajian Am';
@@ -3347,7 +3347,10 @@ class AttendanceEngine {
       };
     }
 
-    const lecturer = this.lecturers.find((l) => l.id === lecturerId);
+    const cleanLookup = (lecturerId || '').trim().toLowerCase();
+    const lecturer = this.lecturers.find(
+      (l) => l.id.toLowerCase() === cleanLookup || l.email.toLowerCase() === cleanLookup
+    );
     if (!lecturer) {
       return {
         success: false,
@@ -3359,7 +3362,7 @@ class AttendanceEngine {
     lecturer.mustChangePin = false;
     lecturer.pinChangedAt = new Date().toISOString();
 
-    if (this.activeLecturer && this.activeLecturer.id === lecturerId) {
+    if (this.activeLecturer && (this.activeLecturer.id === lecturer.id || this.activeLecturer.email.toLowerCase() === lecturer.email.toLowerCase())) {
       this.activeLecturer = { ...lecturer };
       this.saveActiveLecturerLocally();
     }
@@ -3390,7 +3393,10 @@ class AttendanceEngine {
     lecturerId: string,
     performedBy = 'Pentadbir Sistem'
   ): Promise<{ success: boolean; message: string; lecturer?: Lecturer }> {
-    const lecturer = this.lecturers.find((l) => l.id === lecturerId);
+    const cleanLookup = (lecturerId || '').trim().toLowerCase();
+    const lecturer = this.lecturers.find(
+      (l) => l.id.toLowerCase() === cleanLookup || l.email.toLowerCase() === cleanLookup
+    );
     if (!lecturer) {
       return {
         success: false,
@@ -3402,7 +3408,7 @@ class AttendanceEngine {
     lecturer.mustChangePin = true;
     delete lecturer.pinChangedAt;
 
-    if (this.activeLecturer && this.activeLecturer.id === lecturerId) {
+    if (this.activeLecturer && (this.activeLecturer.id === lecturer.id || this.activeLecturer.email.toLowerCase() === lecturer.email.toLowerCase())) {
       this.activeLecturer = { ...lecturer };
       this.saveActiveLecturerLocally();
     }

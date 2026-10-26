@@ -34,10 +34,15 @@ import {
   Info,
   Edit3,
   Trash2,
-  Copy
+  Copy,
+  KeyRound,
+  Lock,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { attendanceEngine } from '../services/attendanceEngine';
+import { soundService } from '../services/soundService';
 import {
   normalizeClassCode,
   STANDARD_CLASS_CATALOGUE,
@@ -304,6 +309,15 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
   const [editingClasses, setEditingClasses] = useState<string[]>([]);
   const [newClassInput, setNewClassInput] = useState<string>('');
 
+  // Voluntary Change Password Modal state
+  const [isChangePasswordModalOpen, setIsChangePasswordModalOpen] = useState(false);
+  const [changeOldPin, setChangeOldPin] = useState('');
+  const [changeNewPin, setChangeNewPin] = useState('');
+  const [changeConfirmPin, setChangeConfirmPin] = useState('');
+  const [changePinError, setChangePinError] = useState<string | null>(null);
+  const [showChangePin, setShowChangePin] = useState(false);
+  const [isSubmittingPassword, setIsSubmittingPassword] = useState(false);
+
   // Distinct college classes for selection
   const allCollegeClasses = useMemo(() => {
     const classMap = new Map<string, string>();
@@ -475,6 +489,56 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
     });
     setTimeout(() => setActionNotice(null), 4000);
     setIsClassSettingsModalOpen(false);
+  };
+
+  const handleChangePasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setChangePinError(null);
+
+    // Verify old PIN if activeLecturer has an existing PIN
+    if (activeLecturer.pin && changeOldPin !== activeLecturer.pin) {
+      setChangePinError('Kata laluan PIN semasa tidak tepat. Sila semak semula.');
+      return;
+    }
+
+    if (!changeNewPin || changeNewPin.length !== 4) {
+      setChangePinError('Kata laluan baharu mestilah tepat 4 digit numerik.');
+      return;
+    }
+
+    if (changeNewPin === '1234') {
+      setChangePinError("Kata laluan baharu tidak boleh menggunakan kata laluan lalai '1234'. Sila pilih 4 angka unik lain.");
+      return;
+    }
+
+    if (changeNewPin !== changeConfirmPin) {
+      setChangePinError('Pengesahan kata laluan baharu tidak sepadan. Sila pastikan kedua-duanya sama.');
+      return;
+    }
+
+    setIsSubmittingPassword(true);
+    try {
+      const res = await attendanceEngine.updateLecturerPassword(activeLecturer.id, changeNewPin);
+      if (res.success && res.lecturer) {
+        soundService.playSuccess();
+        setActionNotice({
+          type: 'success',
+          message: `Kata laluan PIN akaun anda (${activeLecturer.email}) telah berjaya dikemas kini!`
+        });
+        setIsChangePasswordModalOpen(false);
+        setChangeOldPin('');
+        setChangeNewPin('');
+        setChangeConfirmPin('');
+      } else {
+        setChangePinError(res.message || 'Gagal mengemas kini kata laluan. Sila cuba lagi.');
+        soundService.playError();
+      }
+    } catch (err: any) {
+      setChangePinError(err?.message || 'Ralat semasa mengemas kini kata laluan.');
+      soundService.playError();
+    } finally {
+      setIsSubmittingPassword(false);
+    }
   };
 
   const handleOpenSessionDetail = (sessionId: string) => {
@@ -709,6 +773,25 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
               {activeLecturer.email}
             </p>
           </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            id="lecturer-btn-change-password"
+            onClick={() => {
+              setChangePinError(null);
+              setChangeOldPin('');
+              setChangeNewPin('');
+              setChangeConfirmPin('');
+              setIsChangePasswordModalOpen(true);
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 border border-slate-700/80 text-xs font-semibold text-slate-200 hover:text-white transition-all cursor-pointer shadow-sm active:scale-95"
+            title="Tukar Kata Laluan PIN 4-Digit Anda"
+          >
+            <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+            <span>Tukar Kata Laluan</span>
+          </button>
         </div>
       </header>
 
@@ -1893,6 +1976,134 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
                 <span>Simpan Tetapan Kelas</span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 4. MODAL: TUKAR KATA LALUAN PENSYARAH */}
+      {isChangePasswordModalOpen && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md animate-fadeIn">
+          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-2xl bg-amber-500/20 border border-amber-500/30 text-amber-400 flex items-center justify-center shadow-md">
+                  <KeyRound className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-bold text-white tracking-tight">Tukar Kata Laluan PIN</h3>
+                  <p className="text-xs text-slate-400 font-mono">{activeLecturer.email}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsChangePasswordModalOpen(false)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-slate-800 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {changePinError && (
+              <div className="p-3.5 rounded-xl bg-rose-500/15 border border-rose-500/40 text-rose-300 text-xs flex items-start gap-2.5">
+                <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+                <span className="leading-snug">{changePinError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleChangePasswordSubmit} className="space-y-4">
+              {activeLecturer.pin && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                    Kata Laluan Semasa (PIN 4-Digit):
+                  </label>
+                  <input
+                    type={showChangePin ? 'text' : 'password'}
+                    inputMode="numeric"
+                    maxLength={4}
+                    required
+                    placeholder="••••"
+                    value={changeOldPin}
+                    onChange={(e) => setChangeOldPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                    className="w-full text-center tracking-[0.5em] text-xl font-mono py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-400 transition-all placeholder:tracking-normal placeholder:text-slate-600"
+                  />
+                </div>
+              )}
+
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs font-semibold text-slate-300">
+                    Kata Laluan Baharu (PIN 4-Digit):
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setShowChangePin(!showChangePin)}
+                    className="text-[11px] text-slate-400 hover:text-slate-200 flex items-center gap-1 cursor-pointer"
+                  >
+                    {showChangePin ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                    <span>{showChangePin ? 'Sembunyi' : 'Lihat'}</span>
+                  </button>
+                </div>
+                <input
+                  type={showChangePin ? 'text' : 'password'}
+                  inputMode="numeric"
+                  maxLength={4}
+                  required
+                  placeholder="••••"
+                  value={changeNewPin}
+                  onChange={(e) => setChangeNewPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  className="w-full text-center tracking-[0.5em] text-xl font-mono py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-amber-400 focus:ring-1 focus:ring-amber-400 transition-all placeholder:tracking-normal placeholder:text-slate-600"
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Mesti 4 angka numerik dan bukan '1234'.
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-300 mb-1.5">
+                  Sahkan Kata Laluan Baharu:
+                </label>
+                <input
+                  type={showChangePin ? 'text' : 'password'}
+                  inputMode="numeric"
+                  maxLength={4}
+                  required
+                  placeholder="••••"
+                  value={changeConfirmPin}
+                  onChange={(e) => setChangeConfirmPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  className="w-full text-center tracking-[0.5em] text-xl font-mono py-2.5 rounded-xl bg-slate-950 border border-slate-700 text-white focus:outline-none focus:border-emerald-400 focus:ring-1 focus:ring-emerald-400 transition-all placeholder:tracking-normal placeholder:text-slate-600"
+                />
+                {changeNewPin && changeConfirmPin && changeNewPin === changeConfirmPin && (
+                  <p className="text-[11px] text-emerald-400 mt-1 flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Kata laluan sepadan!</span>
+                  </p>
+                )}
+              </div>
+
+              <div className="pt-2 flex items-center justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsChangePasswordModalOpen(false)}
+                  className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 text-xs font-semibold transition-all cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  id="btn-submit-change-password"
+                  disabled={
+                    isSubmittingPassword ||
+                    changeNewPin.length !== 4 ||
+                    changeConfirmPin.length !== 4 ||
+                    (activeLecturer.pin ? changeOldPin.length !== 4 : false)
+                  }
+                  className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-400 hover:to-amber-500 disabled:opacity-50 text-slate-950 text-xs font-bold shadow-lg shadow-amber-500/20 transition-all flex items-center gap-2 cursor-pointer active:scale-95"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>{isSubmittingPassword ? 'Menyimpan...' : 'Simpan Kata Laluan'}</span>
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

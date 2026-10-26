@@ -6,7 +6,7 @@ export const INITIAL_LECTURERS: Lecturer[] = [
     name: 'AHMAD KHAIRI BIN MOHD',
     email: 'khairi.mohd@mara.gov.my',
     icNumber: '861115-01-5305',
-    pin: '5313',
+    pin: '5305',
     mustChangePin: false,
     pinChangedAt: '2025-01-10T08:00:00.000Z',
     phone: '012-3456789',
