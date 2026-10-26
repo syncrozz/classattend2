@@ -123,52 +123,75 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Active Session Pill, Lecturer Badge & Actions */}
         <div className="flex items-center gap-2 sm:gap-3">
-          {/* Active Class Session Indicator */}
+          {/* Active Class Session Indicator: Only interactive / closable if lecturer or admin is logged in */}
           {activeSession ? (
-            <div
-              id="header-active-session-indicator"
-              role="button"
-              tabIndex={0}
-              onClick={(e) => {
-                e.stopPropagation();
-                if (onCloseActiveSession) {
-                  onCloseActiveSession(activeSession.id);
-                }
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
+            isPrivileged ? (
+              <div
+                id="header-active-session-indicator"
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
                   if (onCloseActiveSession) {
                     onCloseActiveSession(activeSession.id);
                   }
-                }
-              }}
-              className="cursor-pointer flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 hover:bg-rose-500/20 hover:border-rose-500/40 text-xs font-medium text-emerald-300 hover:text-rose-200 transition-all group select-none active:scale-95 shadow-sm shadow-emerald-950/40"
-              title={`Klik untuk Tutup Sesi: ${formatSessionHeaderTitle(activeSession)}`}
-            >
-              {/* Normal status pulse dot */}
-              <span className="relative flex h-2 w-2 group-hover:hidden shrink-0">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
-              </span>
-              
-              {/* Close icon on hover */}
-              <span className="hidden group-hover:flex items-center justify-center w-3 h-3 text-rose-300 shrink-0">
-                <X className="w-3.5 h-3.5 stroke-[3]" />
-              </span>
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    if (onCloseActiveSession) {
+                      onCloseActiveSession(activeSession.id);
+                    }
+                  }
+                }}
+                className="cursor-pointer flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 hover:bg-rose-500/20 hover:border-rose-500/40 text-xs font-medium text-emerald-300 hover:text-rose-200 transition-all group select-none active:scale-95 shadow-sm shadow-emerald-950/40"
+                title={`Klik untuk Tutup Sesi: ${formatSessionHeaderTitle(activeSession)}`}
+              >
+                {/* Normal status pulse dot */}
+                <span className="relative flex h-2 w-2 group-hover:hidden shrink-0">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                
+                {/* Close icon on hover */}
+                <span className="hidden group-hover:flex items-center justify-center w-3 h-3 text-rose-300 shrink-0">
+                  <X className="w-3.5 h-3.5 stroke-[3]" />
+                </span>
 
-              <span className="truncate max-w-[130px] sm:max-w-[200px] text-slate-200 group-hover:text-rose-100 font-semibold transition-colors">
-                {formatSessionHeaderTitle(activeSession)}
-              </span>
+                <span className="truncate max-w-[130px] sm:max-w-[200px] text-slate-200 group-hover:text-rose-100 font-semibold transition-colors">
+                  {formatSessionHeaderTitle(activeSession)}
+                </span>
 
-              {/* Status badge: Normal state shows KELAS BUKA, hover state shows TUTUP SESI */}
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 group-hover:hidden transition-all whitespace-nowrap">
-                KELAS BUKA
-              </span>
-              <span className="hidden group-hover:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/30 text-rose-200 uppercase font-extrabold border border-rose-500/50 shadow-xs transition-all whitespace-nowrap">
-                TUTUP SESI
-              </span>
-            </div>
+                {/* Status badge: Normal state shows KELAS BUKA, hover state shows TUTUP SESI */}
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 group-hover:hidden transition-all whitespace-nowrap">
+                  KELAS BUKA
+                </span>
+                <span className="hidden group-hover:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/30 text-rose-200 uppercase font-extrabold border border-rose-500/50 shadow-xs transition-all whitespace-nowrap">
+                  TUTUP SESI
+                </span>
+              </div>
+            ) : (
+              /* Non-privileged view (Pelajar / Pengguna bukan login pensyarah) -> Non-clickable read-only badge, cannot close session */
+              <div
+                id="header-active-session-indicator"
+                role="status"
+                className="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-medium text-emerald-300 select-none shadow-sm shadow-emerald-950/40 pointer-events-none"
+                title={`Sesi Kelas Sedang Dibuka: ${formatSessionHeaderTitle(activeSession)}`}
+              >
+                <span className="relative flex h-2 w-2 shrink-0">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+
+                <span className="truncate max-w-[130px] sm:max-w-[200px] text-slate-200 font-semibold">
+                  {formatSessionHeaderTitle(activeSession)}
+                </span>
+
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 whitespace-nowrap">
+                  KELAS BUKA
+                </span>
+              </div>
+            )
           ) : (
             <div className="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-800/60 border border-slate-700/60 text-xs text-slate-400">
               <span className="w-2 h-2 rounded-full bg-slate-500"></span>
@@ -254,17 +277,6 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           )}
 
-          {/* Quick Scanner Action Button - Contextually hidden when Lecturer Workspace is active */}
-          {!isLecturerWorkspaceActive && (
-            <button
-              id="header-btn-quick-scanner"
-              onClick={onOpenScanner}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/30 transition-all active:scale-95 cursor-pointer"
-            >
-              <QrCode className="w-4 h-4" />
-              <span className="hidden sm:inline">Imbas QR</span>
-            </button>
-          )}
 
           {/* Cloud Firestore Sync Button */}
           {onForceSyncCloud && (

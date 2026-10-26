@@ -934,7 +934,11 @@ export default function App() {
         onOpenScanner={() => handleTabChange('scanner')}
         onToggleAdminMode={handleToggleAdminMode}
         onLogoutLecturer={handleLogoutLecturer}
-        onCloseActiveSession={(id) => handleSetSessionStatus(id, 'CLOSED')}
+        onCloseActiveSession={(id) => {
+          if (isAdmin || activeLecturer) {
+            handleSetSessionStatus(id, 'CLOSED');
+          }
+        }}
         isLecturerWorkspaceActive={activeTab === 'dashboard' && currentRole === 'LECTURER' && Boolean(activeLecturer)}
         onForceSyncCloud={handleForceSyncCloud}
         isSyncingCloud={isSyncingCloud}

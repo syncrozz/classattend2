@@ -989,7 +989,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           }`}
         >
           <Tv className="w-4 h-4" />
-          <span>Paparan QR Projektor (Pelajar Imbas)</span>
+          <span>Pelajar Imbas</span>
         </button>
 
         <button
@@ -1003,7 +1003,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           }`}
         >
           <Search className="w-4 h-4" />
-          <span>Carian & Input Manual</span>
+          <span>Carian Manual</span>
         </button>
       </div>
 
