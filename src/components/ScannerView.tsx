@@ -245,6 +245,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const [currentVolume, setCurrentVolume] = useState<number>(() => soundService.getVolume());
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
   const [backupToast, setBackupToast] = useState<string | null>(null);
+  const [simulatedStudentId, setSimulatedStudentId] = useState<string>('');
+  const [simulateSuccessMsg, setSimulateSuccessMsg] = useState<string | null>(null);
 
   const activePaceConfig = getActivePaceConfig(scanPace);
 
@@ -828,8 +830,8 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               </button>
             )}
 
-            {/* Primary Action: Tamatkan Sesi */}
-            {currentSession?.status === 'OPEN' && (
+            {/* Primary Action: Tamatkan Sesi (Lecturers & Admins only, hidden on Projector mode to prevent student access) */}
+            {currentSession?.status === 'OPEN' && (isAdmin || activeLecturer) && scannerMode !== 'PROJECTOR_QR' && (
               <button
                 type="button"
                 id="btn-close-session-header"
@@ -1268,8 +1270,62 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                     }}
                     className="w-full sm:w-auto px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-lg shadow-indigo-600/30 active:scale-95"
                   >
-                    <span>🧪 Uji Paparan Pelajar (Buka Sini)</span>
+                    <Sparkles className="w-3.5 h-3.5 text-indigo-300" />
+                    <span>🧪 Uji Simulasi Pelajar (Buka Sini)</span>
                   </button>
+                </div>
+
+                {/* Simulation Panel for Projector Testing */}
+                <div className="mt-4 p-4 rounded-2xl bg-slate-950/90 border border-slate-800 text-left space-y-3 max-w-md mx-auto">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-300">
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Simulasi Kehadiran Pelajar (Tanpa Statistik / Tanpa Kawalan Sesi)</span>
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Uji imbasan kehadiran sebagai pelajar kelas ini. Selepas imbasan berjaya, pelajar hanya melihat notifikasi pengesahan hadir tanpa paparan statistik atau kebenaran menekan butang buka/tutup sesi.
+                  </p>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <select
+                      id="select-simulate-student-projector"
+                      value={simulatedStudentId}
+                      onChange={(e) => setSimulatedStudentId(e.target.value)}
+                      className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white focus:outline-none focus:border-indigo-500 cursor-pointer"
+                    >
+                      <option value="">-- Pilih Pelajar Untuk Simulasi --</option>
+                      {targetStudents.slice(0, 30).map((st) => {
+                        const isAlreadyPresent = matchingPresentRecords.some(r => r.studentId === st.id || r.studentId === st.studentId);
+                        return (
+                          <option key={st.id} value={st.studentId}>
+                            {isAlreadyPresent ? '✓ Hadir' : '○ Belum Hadir'} • {st.name} ({st.studentId})
+                          </option>
+                        );
+                      })}
+                    </select>
+                    <button
+                      type="button"
+                      id="btn-simulate-projector-scan"
+                      disabled={!simulatedStudentId}
+                      onClick={() => {
+                        if (simulatedStudentId) {
+                          handleScannedData(simulatedStudentId, 'QR');
+                          const stObj = students.find(s => s.studentId === simulatedStudentId || s.id === simulatedStudentId);
+                          setSimulateSuccessMsg(`Kehadiran ${stObj?.name || simulatedStudentId} direkodkan! Tiada paparan statistik & tiada butang buka/tutup sesi diberikan kepada pelajar.`);
+                          setTimeout(() => setSimulateSuccessMsg(null), 5000);
+                        }
+                      }}
+                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-bold text-xs shadow-md shadow-emerald-600/30 transition-all cursor-pointer whitespace-nowrap active:scale-95"
+                    >
+                      ⚡ Simulasikan Hadir
+                    </button>
+                  </div>
+                  {simulateSuccessMsg && (
+                    <div className="p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 text-xs font-semibold flex items-center gap-2 animate-fadeIn">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>{simulateSuccessMsg}</span>
+                    </div>
+                  )}
                 </div>
 
                 {/* Session Meta on Projector */}

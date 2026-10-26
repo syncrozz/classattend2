@@ -1100,6 +1100,8 @@ export default function App() {
                 attendanceRecords={attendanceRecords}
                 lecturers={lecturers}
                 activeLecturer={activeLecturer}
+                isAdmin={isAdmin}
+                currentRole={currentRole}
                 onOpenScanner={() => handleTabChange('scanner')}
                 onGoToActivities={() => handleTabChange('dashboard')}
                 onGoToStudents={() => handleTabChange('students')}
@@ -1248,10 +1250,6 @@ export default function App() {
         onSuccess={(student, record) => {
           // Re-sync attendance records from engine
           setAttendanceRecords(attendanceEngine.getAttendanceRecords());
-        }}
-        onViewMyAttendance={(studentId) => {
-          setIsStudentCheckinOpen(false);
-          handleTabChange('my-attendance');
         }}
       />
 

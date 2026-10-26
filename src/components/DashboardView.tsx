@@ -49,6 +49,8 @@ interface DashboardViewProps {
   attendanceRecords: AttendanceRecord[];
   lecturers?: Lecturer[];
   activeLecturer?: Lecturer | null;
+  isAdmin?: boolean;
+  currentRole?: string;
   onOpenScanner: () => void;
   onGoToActivities: () => void;
   onGoToStudents: () => void;
@@ -65,6 +67,8 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   attendanceRecords,
   lecturers = [],
   activeLecturer,
+  isAdmin = false,
+  currentRole = 'STUDENT',
   onOpenScanner,
   onGoToActivities,
   onGoToStudents,
@@ -351,17 +355,17 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </div>
                 </div>
 
-                {/* Action Buttons */}
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    id="dashboard-btn-open-scanner"
-                    onClick={onOpenScanner}
-                    className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow-lg shadow-indigo-600/30 transition-all cursor-pointer"
-                  >
-                    <QrCode className="w-4 h-4" />
-                    <span>Buka Kamera QR</span>
-                  </button>
-                  {activeLecturer && (
+                {/* Action Buttons: Only lecturers and admins have access to open scanner or close session */}
+                {(isAdmin || activeLecturer) ? (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      id="dashboard-btn-open-scanner"
+                      onClick={onOpenScanner}
+                      className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-semibold text-xs shadow-lg shadow-indigo-600/30 transition-all cursor-pointer"
+                    >
+                      <QrCode className="w-4 h-4" />
+                      <span>Buka Kamera QR</span>
+                    </button>
                     <button
                       id="dashboard-btn-close-session"
                       onClick={() => onCloseActiveSession(activeSession.id)}
@@ -370,8 +374,15 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     >
                       Tutup Sesi
                     </button>
-                  )}
-                </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 shrink-0">
+                    <div className="px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-xs font-bold flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                      <span>Sesi Kuliah Aktif</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Progress Bar */}
@@ -404,14 +415,16 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               Imbasan kehadiran QR dibuka semasa waktu kuliah oleh pensyarah kursus masing-masing.
             </p>
           </div>
-          <button
-            id="dashboard-btn-goto-activities"
-            onClick={onGoToActivities}
-            className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs sm:text-sm font-semibold transition-all cursor-pointer shrink-0"
-          >
-            <BookOpen className="w-4 h-4" />
-            <span>{activeLecturer ? 'Pilih Subjek & Buka Sesi' : 'Lihat Jadual Sesi & Kursus'}</span>
-          </button>
+          {(isAdmin || activeLecturer) && (
+            <button
+              id="dashboard-btn-goto-activities"
+              onClick={onGoToActivities}
+              className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs sm:text-sm font-semibold transition-all cursor-pointer shrink-0"
+            >
+              <BookOpen className="w-4 h-4" />
+              <span>Pilih Subjek & Buka Sesi</span>
+            </button>
+          )}
         </div>
       )}
 

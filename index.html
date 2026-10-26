@@ -80,14 +80,16 @@
           }
         } catch(e) {}
 
-        // 4. One-time clean cache-busting URL navigation
-        if (lastBuild !== APP_BUILD_ID) {
-          localStorage.setItem('classattend_build_id', APP_BUILD_ID);
-          if (!window.location.search.includes('v=' + APP_BUILD_ID)) {
-            var url = window.location.pathname + '?v=' + APP_BUILD_ID + window.location.hash;
-            window.location.replace(url);
+        // 4. One-time clean cache-busting URL navigation (safe in iframe)
+        try {
+          if (lastBuild !== APP_BUILD_ID) {
+            localStorage.setItem('classattend_build_id', APP_BUILD_ID);
+            if (!window.location.search.includes('v=' + APP_BUILD_ID)) {
+              var url = window.location.pathname + '?v=' + APP_BUILD_ID + window.location.hash;
+              window.location.replace(url);
+            }
           }
-        }
+        } catch(e) {}
       })();
     </script>
   </head>

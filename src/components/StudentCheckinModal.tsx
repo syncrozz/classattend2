@@ -60,7 +60,6 @@ interface StudentCheckinModalProps {
   students: Student[];
   attendanceRecords: AttendanceRecord[];
   onSuccess?: (student: Student, record: AttendanceRecord) => void;
-  onViewMyAttendance?: (studentId: string) => void;
 }
 
 export const StudentCheckinModal: React.FC<StudentCheckinModalProps> = ({
@@ -70,8 +69,7 @@ export const StudentCheckinModal: React.FC<StudentCheckinModalProps> = ({
   sessions,
   students,
   attendanceRecords,
-  onSuccess,
-  onViewMyAttendance
+  onSuccess
 }) => {
   // Saved Student Identity from localStorage
   const [savedStudentId, setSavedStudentId] = useState<string>(() => {
@@ -512,30 +510,19 @@ export const StudentCheckinModal: React.FC<StudentCheckinModalProps> = ({
               </div>
 
               <p className="text-xs text-emerald-300/90 font-medium">
-                Rekod kehadiran anda telah disimpan secara selamat.
+                Terima kasih! Rekod kehadiran anda telah berjaya disimpan dan disahkan.
               </p>
 
-              {/* Optional Actions */}
-              <div className="pt-2 flex flex-col gap-2">
-                {onViewMyAttendance && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onViewMyAttendance(verifiedStudent.id);
-                      onClose();
-                    }}
-                    className="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs transition-all shadow-lg shadow-indigo-600/30 cursor-pointer flex items-center justify-center gap-2"
-                  >
-                    <BookOpen className="w-4 h-4" />
-                    <span>Lihat Kehadiran Saya</span>
-                  </button>
-                )}
+              {/* Selesai Action - No statistics & No session open/close buttons */}
+              <div className="pt-2">
                 <button
                   type="button"
+                  id="btn-finish-student-checkin"
                   onClick={onClose}
-                  className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs transition-all cursor-pointer"
+                  className="w-full py-3 rounded-2xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-extrabold text-sm shadow-lg shadow-emerald-900/30 transition-all cursor-pointer flex items-center justify-center gap-2 active:scale-98"
                 >
-                  Tutup
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Selesai & Tutup</span>
                 </button>
               </div>
             </div>
@@ -569,26 +556,16 @@ export const StudentCheckinModal: React.FC<StudentCheckinModalProps> = ({
                 </div>
               </div>
 
-              <div className="pt-2 flex flex-col gap-2">
-                {onViewMyAttendance && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onViewMyAttendance(verifiedStudent.id);
-                      onClose();
-                    }}
-                    className="w-full py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs transition-all cursor-pointer flex items-center justify-center gap-2"
-                  >
-                    <BookOpen className="w-4 h-4" />
-                    <span>Lihat Kehadiran Saya</span>
-                  </button>
-                )}
+              {/* Selesai Action - No statistics & No session open/close buttons */}
+              <div className="pt-2">
                 <button
                   type="button"
+                  id="btn-finish-duplicate-checkin"
                   onClick={onClose}
-                  className="w-full py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs transition-all cursor-pointer"
+                  className="w-full py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 text-white font-extrabold text-sm transition-all cursor-pointer flex items-center justify-center gap-2 active:scale-98"
                 >
-                  Selesai
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Selesai & Tutup</span>
                 </button>
               </div>
             </div>
