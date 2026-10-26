@@ -31,7 +31,7 @@ const DEFAULT_SEEDED_LOGS: AuditLogItem[] = [
     timestamp: new Date(Date.now() - 3600000 * 8).toISOString(),
     category: 'LECTURER_STATUS',
     action: 'Pengesahan Pendaftaran Pensyarah',
-    details: 'Akaun pensyarah khairi.mohd@mara.gov.my telah disahkan dan diaktifkan dengan peranan ADMIN.',
+    details: 'Akaun pensyarah khairi.mohd@mara.gov.my telah disahkan dan diaktifkan dengan peranan PENSYARAH.',
     performedBy: 'Master Admin',
     target: 'khairi.mohd@mara.gov.my',
     severity: 'SUCCESS'

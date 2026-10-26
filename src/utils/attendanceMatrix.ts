@@ -329,7 +329,7 @@ export function getScopedSubjectsForClass(
   isAdmin: boolean = false
 ): ScopedSubjectOption[] {
   const subjectMap = new Map<string, string>(); // code -> name
-  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin && activeLecturer.role !== 'ADMIN');
+  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin);
 
   if (isLecturerRestricted && activeLecturer) {
     const lecId = (activeLecturer.id || '').trim().toLowerCase();

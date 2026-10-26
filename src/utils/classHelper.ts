@@ -97,12 +97,26 @@ export const isStudentInClasses = (studentClass: string, targetClasses: string[]
  * Standard College Class Catalogue fallback if not yet loaded from DB
  */
 export const STANDARD_CLASS_CATALOGUE = [
+  'DIA1A', 'DIA1B',
+  'DIA2A', 'DIA2B',
   'DIA3A', 'DIA3B', 'DIA3C', 'DIA3D',
   'DIA4A', 'DIA4B', 'DIA4C', 'DIA4D',
   'DLM4A', 'DLM4B', 'DLM4C', 'DLM4E',
   'DLC1A', 'DLC1B', 'DLC1C',
   'DLS2A', 'DLS2B'
 ];
+
+/**
+ * Resolves any class string format ("DIA_4A", "dia 4a", "DIA4A") to the canonical standard class code.
+ */
+export const toCanonicalClassCode = (cls: string): string => {
+  if (!cls) return '';
+  const norm = normalizeClassCode(cls);
+  const match = STANDARD_CLASS_CATALOGUE.find((c) => normalizeClassCode(c) === norm);
+  if (match) return match;
+  return cls.trim().toUpperCase().replace(/[\s_-]+/g, '');
+};
+
 
 export interface ClassValidationResult {
   isValid: boolean;

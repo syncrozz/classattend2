@@ -8,7 +8,7 @@ import {
   Enrollment,
   TeachingAssignment
 } from '../types';
-import { areClassesMatching, normalizeClassCode } from '../utils/classHelper';
+import { areClassesMatching, normalizeClassCode, toCanonicalClassCode } from '../utils/classHelper';
 import { filterAuthorizedSessions } from '../utils/sessionAuth';
 import {
   getClassBadgeColor,
@@ -90,7 +90,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   onDeleteStudent
 }) => {
   // Determine if lecturer privacy scoping is active (True when lecturer is logged in and not an Admin)
-  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin && activeLecturer.role !== 'ADMIN');
+  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin);
 
   // Authorized sessions: When restricted, only sessions belonging to this lecturer are accessible
   const authorizedSessions = useMemo(() => {
@@ -105,7 +105,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     if (!isLecturerRestricted || !activeLecturer) {
       return null; // Admin sees all classes
     }
-    const classSet = new Set<string>();
+    const classMap = new Map<string, string>();
 
     // 1. From Teaching Assignments (authoritative)
     (teachingAssignments || []).forEach((ta) => {
@@ -122,24 +122,35 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
         ta.lecturerName.trim().toLowerCase() === activeLecturer.name.trim().toLowerCase()
       );
       if (isActive && (matchId || matchEmail || matchName) && ta.className) {
-        classSet.add(ta.className.trim());
+        const norm = normalizeClassCode(ta.className);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(ta.className));
+        }
       }
     });
 
     // 2. From assignedClasses / assignedSections on lecturer profile
     const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
     profileClasses.forEach((cls) => {
-      if (cls && cls.trim()) classSet.add(cls.trim());
+      if (cls && cls.trim()) {
+        const norm = normalizeClassCode(cls);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(cls));
+        }
+      }
     });
 
     // 3. From authorized sessions
     authorizedSessions.forEach((s) => {
       if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
-        classSet.add(s.className.trim());
+        const norm = normalizeClassCode(s.className);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(s.className));
+        }
       }
     });
 
-    return Array.from(classSet);
+    return Array.from(classMap.values());
   }, [isLecturerRestricted, activeLecturer, teachingAssignments, authorizedSessions]);
 
   // Unique classes dynamically scoped:
@@ -147,22 +158,29 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
   // Otherwise, all classes registered in students/sessions.
   const uniqueClasses: string[] = useMemo(() => {
     if (lecturerClasses !== null) {
-      const filtered = Array.from(
-        new Set([
-          ...lecturerClasses,
-          ...(authorizedSessions.map((s) => s.className?.trim()).filter(Boolean) as string[])
-        ])
-      ).filter((c) => c && c !== 'ALL' && c !== 'SEMUA');
+      const classMap = new Map<string, string>();
+      [...lecturerClasses, ...(authorizedSessions.map((s) => s.className?.trim()).filter(Boolean) as string[])].forEach((c) => {
+        if (c && c !== 'ALL' && c !== 'SEMUA') {
+          const norm = normalizeClassCode(c);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(c));
+          }
+        }
+      });
 
-      return filtered.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
 
-    return Array.from(
-      new Set([
-        ...(students.map((s) => s.className?.trim()).filter(Boolean) as string[]),
-        ...(sessions.map((s) => s.className?.trim()).filter(Boolean) as string[])
-      ])
-    ).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const classMap = new Map<string, string>();
+    [...(students.map((s) => s.className?.trim()).filter(Boolean) as string[]), ...(sessions.map((s) => s.className?.trim()).filter(Boolean) as string[])].forEach((c) => {
+      if (c && c !== 'ALL' && c !== 'SEMUA') {
+        const norm = normalizeClassCode(c);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(c));
+        }
+      }
+    });
+    return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   }, [students, sessions, authorizedSessions, lecturerClasses]);
 
   // Scoped students: Only students belonging to the lecturer's assigned classes

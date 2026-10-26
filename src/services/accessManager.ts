@@ -82,11 +82,12 @@ class AccessManager {
           return { state: 'ACCESS_EXPIRED', session: null, lecturer: null, role: 'LECTURER' };
         }
 
+        const isCoAdmin = (foundLecturer.role === 'ADMIN' || attendanceEngine.isEmailCoAdmin(foundLecturer.email));
         return {
           state: 'ACCESS_GRANTED',
           session,
           lecturer: foundLecturer,
-          role: 'LECTURER'
+          role: isCoAdmin ? 'ADMIN' : 'LECTURER'
         };
       }
 

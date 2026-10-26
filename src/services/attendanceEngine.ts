@@ -66,7 +66,8 @@ const STORAGE_KEYS = {
   ENROLLMENTS: 'classattend_enrollments_v5',
   TEACHING_ASSIGNMENTS: 'classattend_teaching_assignments_v5',
   ACTIVE_LECTURER: 'classattend_active_lecturer_v5',
-  INITIALIZED: 'classattend_initialized_v5'
+  INITIALIZED: 'classattend_initialized_v5',
+  CO_ADMINS: 'classattend_co_admins_v1'
 };
 
 const inMemoryFallbackStorage: Record<string, string> = {};
@@ -132,6 +133,8 @@ class AttendanceEngine {
   private sessionListeners: Set<(sessions: AttendanceSession[]) => void> = new Set();
   private recordListeners: Set<(records: AttendanceRecord[]) => void> = new Set();
   private teachingAssignmentListeners: Set<(assignments: TeachingAssignment[]) => void> = new Set();
+  private coAdminEmails: string[] = [];
+  private coAdminListeners: Set<(emails: string[]) => void> = new Set();
 
   // Singleton shared Firestore listener handles (one active listener per collection)
   private studentFirestoreUnsub: (() => void) | null = null;
@@ -264,6 +267,14 @@ class AttendanceEngine {
         this.teachingAssignments = JSON.parse(storedAssignments);
         this.notifyTeachingAssignmentListeners();
       }
+
+      const storedCoAdmins = safeStorageGet(STORAGE_KEYS.CO_ADMINS);
+      if (storedCoAdmins) {
+        try {
+          this.coAdminEmails = JSON.parse(storedCoAdmins);
+          this.notifyCoAdminListeners();
+        } catch {}
+      }
     } catch (err) {
       console.warn('Error during cross-tab reload sync:', err);
     }
@@ -282,6 +293,22 @@ class AttendanceEngine {
         const storedEnrollments = safeStorageGet(STORAGE_KEYS.ENROLLMENTS);
         const storedAssignments = safeStorageGet(STORAGE_KEYS.TEACHING_ASSIGNMENTS);
         const storedActiveLecturer = safeStorageGet(STORAGE_KEYS.ACTIVE_LECTURER);
+
+        const storedCoAdmins = safeStorageGet(STORAGE_KEYS.CO_ADMINS);
+        if (storedCoAdmins) {
+          try {
+            this.coAdminEmails = JSON.parse(storedCoAdmins);
+          } catch {
+            this.coAdminEmails = [];
+          }
+        } else {
+          this.coAdminEmails = [];
+        }
+        // Strict requirement: Ensure khairi.mohd@mara.gov.my is not co-admin by default
+        this.coAdminEmails = this.coAdminEmails.filter(
+          (e) => e.toLowerCase().trim() !== 'khairi.mohd@mara.gov.my' && e.toLowerCase().trim() !== 'khairi@mara.gov.my'
+        );
+        safeStorageSet(STORAGE_KEYS.CO_ADMINS, JSON.stringify(this.coAdminEmails));
 
         if (storedStudents) {
           const parsed: Student[] = JSON.parse(storedStudents);
@@ -313,7 +340,7 @@ class AttendanceEngine {
           this.lecturers = [...INITIAL_LECTURERS];
           this.saveLecturersLocally();
         } else {
-          // Always ensure Ahmad Khairi Bin Mohd exists in lecturers with correct email, ADMIN role and PIN
+          // Ensure Ahmad Khairi Bin Mohd exists in lecturers with correct email, LECTURER role and standard PIN
           const khairiInList = this.lecturers.find(
             (l) => l.id === 'LEC-KHAIRI' || l.name.toUpperCase().includes('AHMAD KHAIRI') || l.email.toLowerCase().includes('khairi')
           );
@@ -322,11 +349,9 @@ class AttendanceEngine {
             this.saveLecturersLocally();
           } else if (khairiInList) {
             khairiInList.email = 'khairi.mohd@mara.gov.my';
-            khairiInList.role = 'ADMIN';
-            if (!khairiInList.pin || khairiInList.pin === '1234') {
-              khairiInList.pin = '5313';
-              khairiInList.mustChangePin = false;
-              khairiInList.pinChangedAt = khairiInList.pinChangedAt || '2025-01-10T08:00:00.000Z';
+            khairiInList.role = this.isEmailCoAdmin('khairi.mohd@mara.gov.my') ? 'ADMIN' : 'LECTURER';
+            if (!khairiInList.pin) {
+              khairiInList.pin = DEFAULT_LECTURER_PIN;
             }
             khairiInList.assignedSubjects = [
               'MPU2162 - PENGAJIAN MALAYSIA 2',
@@ -337,6 +362,22 @@ class AttendanceEngine {
             this.saveLecturersLocally();
           }
         }
+
+        // Sanitize all stored lecturers against co-admin list:
+        this.lecturers = this.lecturers.map((lec) => {
+          const lEmail = (lec.email || '').toLowerCase().trim();
+          if (lEmail === 'khairi.mohd@mara.gov.my' || lec.id === 'LEC-KHAIRI') {
+            return {
+              ...lec,
+              role: this.isEmailCoAdmin(lEmail) ? ('ADMIN' as const) : ('LECTURER' as const)
+            };
+          }
+          if (this.isEmailCoAdmin(lEmail)) {
+            return { ...lec, role: 'ADMIN' as const };
+          }
+          return lec;
+        });
+        this.saveLecturersLocally();
         this.subjects = storedSubjects ? JSON.parse(storedSubjects) : [];
         if (this.subjects.length === 0 && INITIAL_SUBJECTS.length > 0) {
           this.subjects = [...INITIAL_SUBJECTS];
@@ -448,6 +489,23 @@ class AttendanceEngine {
               });
             }
           });
+
+          // Deduplicate teaching assignments so there are never multiple entries for the same lecturer + subject + normalized class
+          const seenTaMap = new Map<string, TeachingAssignment>();
+          this.teachingAssignments.forEach((ta) => {
+            const lecKey = (ta.lecturerEmail || ta.lecturerId || '').trim().toLowerCase();
+            const subjKey = (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '');
+            const classKey = normalizeClassCode(ta.className);
+            const key = `${lecKey}_${subjKey}_${classKey}`;
+            if (!seenTaMap.has(key)) {
+              const canonical = ['DIA1A', 'DIA1B', 'DIA2A', 'DIA3A', 'DIA4A', 'DIA4B', 'DIA4C'].find((c) => normalizeClassCode(c) === classKey) || classKey;
+              seenTaMap.set(key, {
+                ...ta,
+                className: canonical
+              });
+            }
+          });
+          this.teachingAssignments = Array.from(seenTaMap.values());
 
           this.saveTeachingAssignmentsLocally();
 
@@ -571,7 +629,17 @@ class AttendanceEngine {
           try {
             const sess = JSON.parse(rawTrusted);
             if (sess && sess.expiresAt && Date.now() < sess.expiresAt) {
-              this.activeLecturer = storedActiveLecturer ? JSON.parse(storedActiveLecturer) : null;
+              const parsedActive: Lecturer | null = storedActiveLecturer ? JSON.parse(storedActiveLecturer) : null;
+              if (parsedActive) {
+                const actEmail = (parsedActive.email || '').toLowerCase().trim();
+                if (actEmail === 'khairi.mohd@mara.gov.my' || parsedActive.id === 'LEC-KHAIRI') {
+                  parsedActive.role = this.isEmailCoAdmin(actEmail) ? ('ADMIN' as const) : ('LECTURER' as const);
+                } else if (this.isEmailCoAdmin(actEmail)) {
+                  parsedActive.role = 'ADMIN' as const;
+                }
+              }
+              this.activeLecturer = parsedActive;
+              this.saveActiveLecturerLocally();
             } else {
               this.activeLecturer = null;
             }
@@ -758,7 +826,7 @@ class AttendanceEngine {
     this.legacyLecturerWarnings = [];
     let migratedCount = 0;
 
-    // Check Ahmad Khairi Bin Mohd: ensure email is khairi.mohd@mara.gov.my, role is ADMIN, pin is 5313
+    // Check Ahmad Khairi Bin Mohd: ensure email is khairi.mohd@mara.gov.my, role is LECTURER unless co-admin
     const khairiLec = this.lecturers.find(
       (l) => l.id === 'LEC-KHAIRI' || l.name.toUpperCase().includes('AHMAD KHAIRI') || l.email.toLowerCase().includes('khairi')
     );
@@ -768,11 +836,9 @@ class AttendanceEngine {
         emailMigrationMap.set(oldKhairiEmail, 'khairi.mohd@mara.gov.my');
         khairiLec.email = 'khairi.mohd@mara.gov.my';
       }
-      khairiLec.role = 'ADMIN';
-      if (!khairiLec.pin || khairiLec.pin === '1234') {
-        khairiLec.pin = '5313';
-        khairiLec.mustChangePin = false;
-        khairiLec.pinChangedAt = khairiLec.pinChangedAt || '2025-01-10T08:00:00.000Z';
+      khairiLec.role = this.isEmailCoAdmin(khairiLec.email) ? 'ADMIN' : 'LECTURER';
+      if (!khairiLec.pin) {
+        khairiLec.pin = DEFAULT_LECTURER_PIN;
       }
     }
     // Always map known Khairi aliases to official khairi.mohd@mara.gov.my
@@ -1366,14 +1432,14 @@ class AttendanceEngine {
                 cleanEmail = convertLegacyLecturerEmail(cleanEmail);
               }
 
-              const isAdminKhairi = cleanEmail === 'khairi.mohd@mara.gov.my' || lec.id === 'LEC-KHAIRI';
+              const isCoAdmin = this.isEmailCoAdmin(cleanEmail);
 
               return {
                 ...lec,
                 email: cleanEmail,
-                role: (isAdminKhairi || lec.role === 'ADMIN') ? ('ADMIN' as const) : ('LECTURER' as const),
-                pin: isAdminKhairi && (!lec.pin || lec.pin === '1234') ? '5313' : (lec.pin || DEFAULT_LECTURER_PIN),
-                mustChangePin: isAdminKhairi ? false : (lec.mustChangePin ?? true),
+                role: (isCoAdmin || (lec.role === 'ADMIN' && cleanEmail !== 'khairi.mohd@mara.gov.my')) ? ('ADMIN' as const) : ('LECTURER' as const),
+                pin: lec.pin || DEFAULT_LECTURER_PIN,
+                mustChangePin: lec.mustChangePin ?? false,
                 assignedClasses: Array.from(new Set(lec.assignedClasses || [])),
                 assignedSections: Array.from(new Set(lec.assignedSections || [])),
                 assignedSubjects: Array.from(new Set(lec.assignedSubjects || []))
@@ -1990,7 +2056,7 @@ class AttendanceEngine {
   public verifyAdminPin(pin: string): { success: boolean; lecturer?: Lecturer; message: string } {
     const raw = pin.trim();
     if (raw === '5313') {
-      const adminLecturer = this.lecturers.find((l) => l.role === 'ADMIN') || {
+      const adminLecturer = this.lecturers.find((l) => (this.isEmailCoAdmin(l.email) || l.role === 'ADMIN') && l.email.toLowerCase().trim() !== 'khairi.mohd@mara.gov.my') || {
         id: 'ADMIN-MASTER',
         name: 'PENTADBIR SISTEM (ADMIN)',
         email: `admin${LECTURER_EMAIL_DOMAIN}`,
@@ -2052,33 +2118,39 @@ class AttendanceEngine {
       };
     }
 
+    const isCoAdmin = this.isEmailCoAdmin(foundLecturer.email) || (foundLecturer.role === 'ADMIN' && cleanEmail !== 'khairi.mohd@mara.gov.my');
+    const effectiveLecturer: Lecturer = {
+      ...foundLecturer,
+      role: isCoAdmin ? ('ADMIN' as const) : ('LECTURER' as const)
+    };
+
     // Master Admin PIN direct verification if entered
-    if (rawInput === '5313' && foundLecturer.role === 'ADMIN') {
-      this.activeLecturer = foundLecturer;
+    if (rawInput === '5313' && isCoAdmin) {
+      this.activeLecturer = effectiveLecturer;
       this.saveActiveLecturerLocally();
       return {
         success: true,
-        lecturer: foundLecturer,
-        message: `Akses Pentadbir Berjaya! Selamat bertugas, ${foundLecturer.name}.`,
-        requirePinChange: Boolean(foundLecturer.mustChangePin)
+        lecturer: effectiveLecturer,
+        message: `Akses Pentadbir Berjaya! Selamat bertugas, ${effectiveLecturer.name}.`,
+        requirePinChange: Boolean(effectiveLecturer.mustChangePin)
       };
     }
 
     // 3. Verify PIN strictly against lecturer.pin (default '1234'), or Master Admin bypass ('5313')
-    const expectedPin = foundLecturer.pin || DEFAULT_LECTURER_PIN;
+    const expectedPin = effectiveLecturer.pin || DEFAULT_LECTURER_PIN;
     const isPinMatch = rawInput === expectedPin;
     const isMasterBypass = rawInput === '5313';
 
     if (isPinMatch || isMasterBypass) {
       // Check status: if PENDING or REJECTED, block login unless admin bypass
-      if (!isMasterBypass && foundLecturer.role !== 'ADMIN') {
-        if (foundLecturer.status === 'PENDING') {
+      if (!isMasterBypass && !isCoAdmin) {
+        if (effectiveLecturer.status === 'PENDING') {
           return {
             success: false,
-            message: `Pendaftaran akaun bagi ${foundLecturer.name} sedang MENUNGGU KELULUSAN Pentadbir (Status: PENDING). Sila hubungi Admin untuk pengesahan.`
+            message: `Pendaftaran akaun bagi ${effectiveLecturer.name} sedang MENUNGGU KELULUSAN Pentadbir (Status: PENDING). Sila hubungi Admin untuk pengesahan.`
           };
         }
-        if (foundLecturer.status === 'REJECTED') {
+        if (effectiveLecturer.status === 'REJECTED') {
           return {
             success: false,
             message: `Pendaftaran akaun pensyarah ini telah DITOLAK (Status: REJECTED). Sila hubungi Pentadbir Kolej.`
@@ -2086,14 +2158,16 @@ class AttendanceEngine {
         }
       }
 
-      this.activeLecturer = foundLecturer;
+      this.activeLecturer = effectiveLecturer;
       this.saveActiveLecturerLocally();
-      const requirePinChange = Boolean(foundLecturer.mustChangePin);
+      const requirePinChange = Boolean(effectiveLecturer.mustChangePin);
 
       return {
         success: true,
-        lecturer: foundLecturer,
-        message: `Pengesahan Berjaya! Selamat bertugas, ${foundLecturer.name}.`,
+        lecturer: effectiveLecturer,
+        message: isCoAdmin
+          ? `Akses Pentadbir (Co-Admin) Berjaya! Selamat bertugas, ${effectiveLecturer.name}.`
+          : `Pengesahan Berjaya! Selamat bertugas, ${effectiveLecturer.name}.`,
         requirePinChange
       };
     }
@@ -2794,8 +2868,16 @@ class AttendanceEngine {
     newClasses: string[],
     lecturer?: Lecturer | null
   ): { subjects: Subject[]; teachingAssignments: TeachingAssignment[] } {
-    const normCode = subjectCode.trim().toUpperCase();
-    const cleanClasses = Array.from(new Set(newClasses.map((c) => c.trim().toUpperCase()).filter(Boolean)));
+    const normCode = subjectCode.trim().toUpperCase().replace(/\s+/g, '');
+    const cleanClassesMap = new Map<string, string>();
+    newClasses.forEach((c) => {
+      const norm = normalizeClassCode(c);
+      if (norm && !cleanClassesMap.has(norm)) {
+        const canonical = ['DIA1A', 'DIA1B', 'DIA2A', 'DIA3A', 'DIA4A', 'DIA4B', 'DIA4C'].find((x) => normalizeClassCode(x) === norm) || c.trim().toUpperCase().replace(/_/g, '');
+        cleanClassesMap.set(norm, canonical);
+      }
+    });
+    const cleanClasses = Array.from(cleanClassesMap.values());
 
     // 1. Update subject.sections
     const subIdx = this.subjects.findIndex((s) => s.code.toUpperCase() === normCode);
@@ -3461,6 +3543,150 @@ class AttendanceEngine {
 
   public getLecturers(): Lecturer[] {
     return [...this.lecturers];
+  }
+
+  // --- Co-Admin Management (Pentadbir Bersama) ---
+  public getCoAdminEmails(): string[] {
+    return [...this.coAdminEmails];
+  }
+
+  public isEmailCoAdmin(email?: string): boolean {
+    if (!email) return false;
+    const clean = email.trim().toLowerCase();
+    return this.coAdminEmails.includes(clean);
+  }
+
+  public addCoAdminEmail(email: string): { success: boolean; message: string } {
+    const clean = email.trim().toLowerCase();
+    if (!clean || !clean.includes('@') || !clean.includes('.')) {
+      return { success: false, message: 'Format emel tidak sah. Sila masukkan alamat emel rasmi yang lengkap.' };
+    }
+    if (clean === 'khairi.mohd@mara.gov.my') {
+      // Allowed if explicitly requested by Admin via UI
+    }
+    if (this.isEmailCoAdmin(clean)) {
+      return { success: false, message: `Emel [${clean}] sudah pun berada dalam senarai Pentadbir Bersama.` };
+    }
+
+    this.coAdminEmails.push(clean);
+    safeStorageSet(STORAGE_KEYS.CO_ADMINS, JSON.stringify(this.coAdminEmails));
+
+    // Promote matching lecturer to ADMIN
+    let matchedName = '';
+    this.lecturers = this.lecturers.map((lec) => {
+      if (lec.email.trim().toLowerCase() === clean) {
+        matchedName = lec.name;
+        return { ...lec, role: 'ADMIN' as const };
+      }
+      return lec;
+    });
+    this.saveLecturersLocally();
+
+    // If active lecturer matches, promote active role
+    if (this.activeLecturer && this.activeLecturer.email.trim().toLowerCase() === clean) {
+      this.activeLecturer = { ...this.activeLecturer, role: 'ADMIN' };
+      this.saveActiveLecturerLocally();
+    }
+
+    if (db) {
+      try {
+        setDoc(doc(db, 'settings', 'co_admins'), {
+          emails: this.coAdminEmails,
+          updatedAt: new Date().toISOString()
+        }, { merge: true }).catch(() => {});
+      } catch {}
+    }
+
+    auditLogger.log({
+      category: 'SECURITY_AUTH',
+      action: 'Lantik Pentadbir Bersama',
+      details: `Emel ${clean}${matchedName ? ` (${matchedName})` : ''} telah dilantik sebagai Pentadbir Bersama Kolej.`,
+      performedBy: this.activeLecturer?.name || 'Pentadbir Sistem',
+      target: clean,
+      severity: 'SUCCESS'
+    });
+
+    this.notifyCoAdminListeners();
+    this.notifyLecturerListeners();
+    this.broadcastChange(STORAGE_KEYS.CO_ADMINS);
+
+    return {
+      success: true,
+      message: `Emel [${clean}] berjaya dilantik sebagai Pentadbir Bersama.`
+    };
+  }
+
+  public removeCoAdminEmail(email: string): { success: boolean; message: string } {
+    const clean = email.trim().toLowerCase();
+    if (!this.isEmailCoAdmin(clean)) {
+      return { success: false, message: `Emel [${clean}] tidak ditemui dalam senarai Pentadbir Bersama.` };
+    }
+
+    this.coAdminEmails = this.coAdminEmails.filter((e) => e !== clean);
+    safeStorageSet(STORAGE_KEYS.CO_ADMINS, JSON.stringify(this.coAdminEmails));
+
+    // Demote matching lecturer to LECTURER
+    let matchedName = '';
+    this.lecturers = this.lecturers.map((lec) => {
+      if (lec.email.trim().toLowerCase() === clean) {
+        matchedName = lec.name;
+        return { ...lec, role: 'LECTURER' as const };
+      }
+      return lec;
+    });
+    this.saveLecturersLocally();
+
+    // If active lecturer matches, demote active role
+    if (this.activeLecturer && this.activeLecturer.email.trim().toLowerCase() === clean) {
+      this.activeLecturer = { ...this.activeLecturer, role: 'LECTURER' };
+      this.saveActiveLecturerLocally();
+    }
+
+    if (db) {
+      try {
+        setDoc(doc(db, 'settings', 'co_admins'), {
+          emails: this.coAdminEmails,
+          updatedAt: new Date().toISOString()
+        }, { merge: true }).catch(() => {});
+      } catch {}
+    }
+
+    auditLogger.log({
+      category: 'SECURITY_AUTH',
+      action: 'Gugurkan Pentadbir Bersama',
+      details: `Akses Pentadbir Bersama bagi ${clean}${matchedName ? ` (${matchedName})` : ''} telah digugurkan kepada Pensyarah.`,
+      performedBy: this.activeLecturer?.name || 'Pentadbir Sistem',
+      target: clean,
+      severity: 'INFO'
+    });
+
+    this.notifyCoAdminListeners();
+    this.notifyLecturerListeners();
+    this.broadcastChange(STORAGE_KEYS.CO_ADMINS);
+
+    return {
+      success: true,
+      message: `Akses Pentadbir Bersama bagi [${clean}] telah digugurkan.`
+    };
+  }
+
+  public subscribeCoAdmins(callback: (emails: string[]) => void): () => void {
+    this.coAdminListeners.add(callback);
+    callback(this.getCoAdminEmails());
+    return () => {
+      this.coAdminListeners.delete(callback);
+    };
+  }
+
+  private notifyCoAdminListeners() {
+    const list = this.getCoAdminEmails();
+    this.coAdminListeners.forEach((cb) => {
+      try {
+        cb(list);
+      } catch (e) {
+        console.warn('CoAdmin listener error:', e);
+      }
+    });
   }
 
   public getSubjects(): Subject[] {

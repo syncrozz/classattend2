@@ -7,7 +7,7 @@ import {
   Lecturer,
   TeachingAssignment
 } from '../types';
-import { areClassesMatching } from '../utils/classHelper';
+import { areClassesMatching, normalizeClassCode, toCanonicalClassCode } from '../utils/classHelper';
 import {
   buildAttendanceMatrix,
   AttendanceMatrixData,
@@ -75,18 +75,89 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
   onUpdateStudent,
   onDeleteStudent
 }) => {
-  // Class selection state (defaults to first available class)
-  const [selectedClass, setSelectedClass] = useState<string>(() => uniqueClasses[0] || 'DIA_4A');
+  // Determine if lecturer privacy scoping is active (When logged in as lecturer and Admin mode is not active)
+  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin);
 
-  // Sync selectedClass if uniqueClasses change
-  React.useEffect(() => {
-    if (uniqueClasses.length > 0 && !uniqueClasses.includes(selectedClass)) {
-      setSelectedClass(uniqueClasses[0]);
+  // Scoped classes for this matrix:
+  // If restricted, strictly limit to classes taught by this lecturer (derived from teaching assignments, profile, and authorized sessions).
+  // If admin, show all uniqueClasses.
+  const availableMatrixClasses = useMemo(() => {
+    if (!isLecturerRestricted || !activeLecturer) {
+      // Admin Mode: Institutional oversight across all college classes
+      const classMap = new Map<string, string>();
+      (uniqueClasses || []).forEach((cls) => {
+        if (cls && cls !== 'ALL' && cls !== 'SEMUA') {
+          const norm = normalizeClassCode(cls);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(cls));
+          }
+        }
+      });
+      return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
-  }, [uniqueClasses, selectedClass]);
 
-  // Determine if lecturer privacy scoping is active
-  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin && activeLecturer.role !== 'ADMIN');
+    const classMap = new Map<string, string>();
+    const lecId = (activeLecturer.id || '').trim().toLowerCase();
+    const lecEmail = (activeLecturer.email || '').trim().toLowerCase();
+    const lecName = (activeLecturer.name || '').trim().toLowerCase();
+
+    // 1. From Teaching Assignments (authoritative)
+    (teachingAssignments || []).forEach((ta) => {
+      const isActive = ta.status === 'ACTIVE' || !ta.status;
+      const matchId = Boolean(ta.lecturerId && ta.lecturerId.trim().toLowerCase() === lecId);
+      const matchEmail = Boolean(ta.lecturerEmail && lecEmail && ta.lecturerEmail.trim().toLowerCase() === lecEmail);
+      const matchName = Boolean(ta.lecturerName && lecName && ta.lecturerName.trim().toLowerCase() === lecName);
+      if (isActive && (matchId || matchEmail || matchName) && ta.className) {
+        const norm = normalizeClassCode(ta.className);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(ta.className));
+        }
+      }
+    });
+
+    // 2. From assignedClasses / assignedSections on lecturer profile
+    const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
+    profileClasses.forEach((cls) => {
+      if (cls && cls.trim()) {
+        const norm = normalizeClassCode(cls);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(cls));
+        }
+      }
+    });
+
+    // 3. From authorized sessions
+    sessions.forEach((s) => {
+      if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
+        const matchId = Boolean(s.lecturerId && s.lecturerId.trim().toLowerCase() === lecId);
+        const matchEmail = Boolean(s.lecturerEmail && lecEmail && s.lecturerEmail.trim().toLowerCase() === lecEmail);
+        const matchName = Boolean(s.lecturerName && lecName && s.lecturerName.trim().toLowerCase() === lecName);
+        if (matchId || matchEmail || matchName) {
+          const norm = normalizeClassCode(s.className);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(s.className));
+          }
+        }
+      }
+    });
+
+    return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }, [isLecturerRestricted, activeLecturer, uniqueClasses, teachingAssignments, sessions]);
+
+  // Class selection state (defaults to first available class)
+  const [selectedClass, setSelectedClass] = useState<string>(() => availableMatrixClasses[0] || 'DIA4A');
+
+  // Sync selectedClass if availableMatrixClasses change
+  React.useEffect(() => {
+    if (availableMatrixClasses.length > 0) {
+      const exists = availableMatrixClasses.some((c) => areClassesMatching(c, selectedClass));
+      if (!exists) {
+        setSelectedClass(availableMatrixClasses[0]);
+      }
+    } else {
+      setSelectedClass('');
+    }
+  }, [availableMatrixClasses, selectedClass]);
 
   // Derive subjects available for the selected class, strictly filtered by lecturer permissions
   const classSubjects = useMemo(() => {
@@ -285,6 +356,11 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
 
   // Target students for the selected class (with optional search query filter)
   const targetStudents = useMemo(() => {
+    // If lecturer is restricted, ensure selectedClass is authorized for this lecturer
+    if (isLecturerRestricted && !availableMatrixClasses.some((c) => areClassesMatching(c, selectedClass))) {
+      return [];
+    }
+
     return students.filter((st) => {
       const matchClass = areClassesMatching(st.className, selectedClass);
       if (!matchClass) return false;
@@ -295,7 +371,7 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
       const id = (st.studentId || st.id || '').toLowerCase();
       return name.includes(q) || id.includes(q);
     });
-  }, [students, selectedClass, searchQuery]);
+  }, [students, selectedClass, searchQuery, isLecturerRestricted, availableMatrixClasses]);
 
   // Calculate complete Attendance Matrix data
   const matrixData: AttendanceMatrixData = useMemo(() => {
@@ -414,9 +490,23 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
       <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-5 space-y-4 shadow-lg no-print">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
           <div>
-            <h3 className="text-lg font-bold text-white tracking-tight">
-              Matriks Kehadiran
-            </h3>
+            <div className="flex items-center gap-2">
+              <h3 className="text-lg font-bold text-white tracking-tight">
+                Matriks Kehadiran
+              </h3>
+              <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider ${
+                isAdmin
+                  ? 'bg-amber-500/10 text-amber-300 border border-amber-500/30'
+                  : 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/30'
+              }`}>
+                {isAdmin ? '🛡️ Akses Pentadbir' : `👨‍🏫 Kelas Ditugaskan Sahaja (${availableMatrixClasses.length} Kelas)`}
+              </span>
+            </div>
+            <p className="text-xs text-slate-400 mt-0.5">
+              {isAdmin
+                ? 'Paparan matriks kehadiran institusi menyeluruh bagi semua kelas kolej.'
+                : `Hanya memaparkan rekod kehadiran bagi kelas dan pelajar yang diajar oleh pensyarah (${activeLecturer?.name || 'Pensyarah'}).`}
+            </p>
           </div>
 
           {/* Action Buttons: Cetak PDF, Eksport CSV & Tambah Pelajar */}
@@ -468,13 +558,18 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
               id="matrix-select-class"
               value={selectedClass}
               onChange={(e) => setSelectedClass(e.target.value)}
-              className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs font-bold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
+              disabled={availableMatrixClasses.length === 0}
+              className="w-full px-3 py-2 rounded-xl bg-slate-950 border border-slate-700 text-xs font-bold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer disabled:opacity-50"
             >
-              {uniqueClasses.map((cls) => (
-                <option key={`matrix-class-${cls}`} value={cls}>
-                  Kelas {cls}
-                </option>
-              ))}
+              {availableMatrixClasses.length === 0 ? (
+                <option value="">Tiada Kelas Ditugaskan</option>
+              ) : (
+                availableMatrixClasses.map((cls) => (
+                  <option key={`matrix-class-${cls}`} value={cls}>
+                    Kelas {cls}
+                  </option>
+                ))
+              )}
             </select>
           </div>
 

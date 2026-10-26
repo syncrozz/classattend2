@@ -39,7 +39,9 @@ import {
 import { QRCodeSVG } from 'qrcode.react';
 import { attendanceEngine } from '../services/attendanceEngine';
 import {
-  normalizeClassCode
+  normalizeClassCode,
+  STANDARD_CLASS_CATALOGUE,
+  toCanonicalClassCode
 } from '../utils/classHelper';
 import {
   filterAuthorizedSessions,
@@ -142,11 +144,15 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
   const availableClassesForSubject = useMemo(() => {
     if (!selectedSubject) return [];
 
-    const normSubjCode = selectedSubject.code.trim().toUpperCase();
-    const authorizedClasses = new Set<string>();
+    const normSubjCode = selectedSubject.code.trim().toUpperCase().replace(/\s+/g, '');
+    const authorizedClassesMap = new Map<string, string>();
 
     myAssignments
-      .filter((ta) => ta.status === 'ACTIVE' && ta.subjectCode && ta.subjectCode.trim().toUpperCase() === normSubjCode)
+      .filter((ta) => {
+        if (ta.status !== 'ACTIVE') return false;
+        const taSubjCode = (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '');
+        return taSubjCode === normSubjCode;
+      })
       .forEach((ta) => {
         if (ta.className && ta.className.trim()) {
           const normCls = normalizeClassCode(ta.className);
@@ -157,22 +163,25 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
           if (normSubjCode === 'MPU2412' && normCls === 'DIA3A') {
             return;
           }
-          authorizedClasses.add(ta.className.trim());
+          const canonical = toCanonicalClassCode(ta.className);
+          if (!authorizedClassesMap.has(normCls)) {
+            authorizedClassesMap.set(normCls, canonical);
+          }
         }
       });
 
     // Authoritative fallback if cache or state was empty
-    if (authorizedClasses.size === 0) {
+    if (authorizedClassesMap.size === 0) {
       if (normSubjCode === 'MPU2162') {
-        authorizedClasses.add('DIA3A');
+        authorizedClassesMap.set('DIA3A', 'DIA3A');
       } else if (normSubjCode === 'MPU2412') {
-        authorizedClasses.add('DIA4A');
-        authorizedClasses.add('DIA4B');
-        authorizedClasses.add('DIA4C');
+        authorizedClassesMap.set('DIA4A', 'DIA4A');
+        authorizedClassesMap.set('DIA4B', 'DIA4B');
+        authorizedClassesMap.set('DIA4C', 'DIA4C');
       }
     }
 
-    return Array.from(authorizedClasses);
+    return Array.from(authorizedClassesMap.values());
   }, [selectedSubject, myAssignments]);
 
   const [selectedClass, setSelectedClass] = useState<string>(() => {
@@ -185,7 +194,7 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
       if (selectedClass !== '') {
         setSelectedClass('');
       }
-    } else if (!availableClassesForSubject.includes(selectedClass)) {
+    } else if (!availableClassesForSubject.some((c) => normalizeClassCode(c) === normalizeClassCode(selectedClass))) {
       setSelectedClass(availableClassesForSubject[0]);
     }
   }, [availableClassesForSubject, selectedClass]);
@@ -193,32 +202,37 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
   // Subject selection handler: recalculates authorized classes and clears/updates selected class
   const handleSelectSubject = (code: string) => {
     setSelectedSubjectCode(code);
-    const normCode = code.trim().toUpperCase();
-    const authorizedForNewSubject = Array.from(
-      new Set(
-        myAssignments
-          .filter((ta) => ta.status === 'ACTIVE' && ta.subjectCode && ta.subjectCode.trim().toUpperCase() === normCode)
-          .map((ta) => ta.className?.trim())
-          .filter((cls): cls is string => {
-            if (!cls) return false;
-            const normCls = normalizeClassCode(cls);
-            if (normCode === 'MPU2162' && normCls !== 'DIA3A') return false;
-            if (normCode === 'MPU2412' && normCls === 'DIA3A') return false;
-            return true;
-          })
-      )
-    );
+    const normCode = (code || '').trim().toUpperCase().replace(/\s+/g, '');
+    const authorizedForNewSubjectMap = new Map<string, string>();
+
+    myAssignments
+      .filter((ta) => {
+        if (ta.status !== 'ACTIVE' || !ta.subjectCode) return false;
+        const taSubjCode = (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '');
+        return taSubjCode === normCode;
+      })
+      .forEach((ta) => {
+        const cls = ta.className?.trim();
+        if (!cls) return;
+        const normCls = normalizeClassCode(cls);
+        if (normCode === 'MPU2162' && normCls !== 'DIA3A') return;
+        if (normCode === 'MPU2412' && normCls === 'DIA3A') return;
+        const canonical = toCanonicalClassCode(cls);
+        if (!authorizedForNewSubjectMap.has(normCls)) {
+          authorizedForNewSubjectMap.set(normCls, canonical);
+        }
+      });
 
     const fallbackList =
-      authorizedForNewSubject.length > 0
-        ? authorizedForNewSubject
+      authorizedForNewSubjectMap.size > 0
+        ? Array.from(authorizedForNewSubjectMap.values())
         : normCode === 'MPU2162'
         ? ['DIA3A']
         : normCode === 'MPU2412'
         ? ['DIA4A', 'DIA4B', 'DIA4C']
         : [];
 
-    if (fallbackList.includes(selectedClass)) {
+    if (fallbackList.some((c) => normalizeClassCode(c) === normalizeClassCode(selectedClass))) {
       // Retain selection if authorized for the new subject
     } else if (fallbackList.length > 0) {
       setSelectedClass(fallbackList[0]);
@@ -292,116 +306,149 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
 
   // Distinct college classes for selection
   const allCollegeClasses = useMemo(() => {
-    const set = new Set<string>(['DIA1A', 'DIA1B', 'DIA2A', 'DIA3A', 'DIA4A', 'DIA4B', 'DIA4C']);
+    const classMap = new Map<string, string>();
+    STANDARD_CLASS_CATALOGUE.forEach((cat) => {
+      classMap.set(normalizeClassCode(cat), cat);
+    });
+
     students.forEach((s) => {
-      if (s.className?.trim()) set.add(s.className.trim().toUpperCase());
+      if (s.className?.trim()) {
+        const norm = normalizeClassCode(s.className);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(s.className));
+        }
+      }
     });
     subjects.forEach((s) => {
       (s.sections || []).forEach((sec) => {
-        if (sec?.trim()) set.add(sec.trim().toUpperCase());
+        if (sec?.trim()) {
+          const norm = normalizeClassCode(sec);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(sec));
+          }
+        }
       });
     });
     editingClasses.forEach((c) => {
-      if (c?.trim()) set.add(c.trim().toUpperCase());
+      if (c?.trim()) {
+        const norm = normalizeClassCode(c);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(c));
+        }
+      }
     });
-    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   }, [students, subjects, editingClasses]);
 
   const handleOpenClassSettings = (subjectCodeToEdit?: string) => {
     const targetCode = subjectCodeToEdit || selectedSubject?.code || availableSubjects[0]?.code || '';
-    const normTargetCode = targetCode.trim().toUpperCase();
+    const normTargetCode = targetCode.trim().toUpperCase().replace(/\s+/g, '');
     setEditingSubjectCode(normTargetCode);
 
     // Find current classes for this subject
-    const currentClasses = new Set<string>();
+    const currentClassesMap = new Map<string, string>();
     myAssignments
-      .filter((ta) => ta.status === 'ACTIVE' && ta.subjectCode?.toUpperCase() === normTargetCode)
+      .filter((ta) => ta.status === 'ACTIVE' && (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '') === normTargetCode)
       .forEach((ta) => {
         if (ta.className?.trim()) {
           const normCls = normalizeClassCode(ta.className);
           if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
           if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
-          currentClasses.add(ta.className.trim().toUpperCase());
+          const canonical = toCanonicalClassCode(ta.className);
+          if (!currentClassesMap.has(normCls)) {
+            currentClassesMap.set(normCls, canonical);
+          }
         }
       });
 
-    const targetSub = subjects.find((s) => s.code.toUpperCase() === normTargetCode);
+    const targetSub = subjects.find((s) => s.code.toUpperCase().replace(/\s+/g, '') === normTargetCode);
     (targetSub?.sections || []).forEach((sec) => {
       if (sec && sec.trim()) {
         const normCls = normalizeClassCode(sec);
         if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
         if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
-        currentClasses.add(sec.trim().toUpperCase());
+        const canonical = toCanonicalClassCode(sec);
+        if (!currentClassesMap.has(normCls)) {
+          currentClassesMap.set(normCls, canonical);
+        }
       }
     });
 
-    if (currentClasses.size === 0) {
-      if (normTargetCode === 'MPU2162') currentClasses.add('DIA3A');
+    if (currentClassesMap.size === 0) {
+      if (normTargetCode === 'MPU2162') currentClassesMap.set('DIA3A', 'DIA3A');
       if (normTargetCode === 'MPU2412') {
-        currentClasses.add('DIA4A');
-        currentClasses.add('DIA4B');
-        currentClasses.add('DIA4C');
+        currentClassesMap.set('DIA4A', 'DIA4A');
+        currentClassesMap.set('DIA4B', 'DIA4B');
+        currentClassesMap.set('DIA4C', 'DIA4C');
       }
     }
 
-    setEditingClasses(Array.from(currentClasses));
+    setEditingClasses(Array.from(currentClassesMap.values()));
     setNewClassInput('');
     setIsClassSettingsModalOpen(true);
   };
 
   const handleSwitchEditingSubject = (code: string) => {
-    const normTargetCode = code.trim().toUpperCase();
+    const normTargetCode = code.trim().toUpperCase().replace(/\s+/g, '');
     setEditingSubjectCode(normTargetCode);
-    const currentClasses = new Set<string>();
+    const currentClassesMap = new Map<string, string>();
     myAssignments
-      .filter((ta) => ta.status === 'ACTIVE' && ta.subjectCode?.toUpperCase() === normTargetCode)
+      .filter((ta) => ta.status === 'ACTIVE' && (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '') === normTargetCode)
       .forEach((ta) => {
         if (ta.className?.trim()) {
           const normCls = normalizeClassCode(ta.className);
           if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
           if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
-          currentClasses.add(ta.className.trim().toUpperCase());
+          const canonical = toCanonicalClassCode(ta.className);
+          if (!currentClassesMap.has(normCls)) {
+            currentClassesMap.set(normCls, canonical);
+          }
         }
       });
 
-    const targetSub = subjects.find((s) => s.code.toUpperCase() === normTargetCode);
+    const targetSub = subjects.find((s) => s.code.toUpperCase().replace(/\s+/g, '') === normTargetCode);
     (targetSub?.sections || []).forEach((sec) => {
       if (sec && sec.trim()) {
         const normCls = normalizeClassCode(sec);
         if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
         if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
-        currentClasses.add(sec.trim().toUpperCase());
+        const canonical = toCanonicalClassCode(sec);
+        if (!currentClassesMap.has(normCls)) {
+          currentClassesMap.set(normCls, canonical);
+        }
       }
     });
 
-    if (currentClasses.size === 0) {
-      if (normTargetCode === 'MPU2162') currentClasses.add('DIA3A');
+    if (currentClassesMap.size === 0) {
+      if (normTargetCode === 'MPU2162') currentClassesMap.set('DIA3A', 'DIA3A');
       if (normTargetCode === 'MPU2412') {
-        currentClasses.add('DIA4A');
-        currentClasses.add('DIA4B');
-        currentClasses.add('DIA4C');
+        currentClassesMap.set('DIA4A', 'DIA4A');
+        currentClassesMap.set('DIA4B', 'DIA4B');
+        currentClassesMap.set('DIA4C', 'DIA4C');
       }
     }
 
-    setEditingClasses(Array.from(currentClasses));
+    setEditingClasses(Array.from(currentClassesMap.values()));
     setNewClassInput('');
   };
 
   const handleToggleClassForEditing = (className: string) => {
-    const upper = className.trim().toUpperCase();
+    const norm = normalizeClassCode(className);
     setEditingClasses((prev) => {
-      if (prev.some((c) => c.toUpperCase() === upper)) {
-        return prev.filter((c) => c.toUpperCase() !== upper);
+      if (prev.some((c) => normalizeClassCode(c) === norm)) {
+        return prev.filter((c) => normalizeClassCode(c) !== norm);
       } else {
-        return [...prev, upper];
+        const canonical = toCanonicalClassCode(className);
+        return [...prev, canonical];
       }
     });
   };
 
   const handleAddCustomClass = () => {
-    const clean = newClassInput.trim().toUpperCase().replace(/[\s\-_]/g, '');
+    const clean = toCanonicalClassCode(newClassInput);
     if (!clean) return;
-    if (!editingClasses.some((c) => c.toUpperCase() === clean)) {
+    const norm = normalizeClassCode(clean);
+    if (!editingClasses.some((c) => normalizeClassCode(c) === norm)) {
       setEditingClasses((prev) => [...prev, clean]);
     }
     setNewClassInput('');

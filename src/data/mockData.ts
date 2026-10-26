@@ -11,7 +11,7 @@ export const INITIAL_LECTURERS: Lecturer[] = [
     pinChangedAt: '2025-01-10T08:00:00.000Z',
     phone: '012-3456789',
     department: 'Jabatan Pengajian Am',
-    role: 'ADMIN',
+    role: 'LECTURER',
     status: 'ACTIVE',
     assignedClasses: ['DIA3A', 'DIA4A'],
     assignedSections: ['DIA3A', 'DIA4A'],

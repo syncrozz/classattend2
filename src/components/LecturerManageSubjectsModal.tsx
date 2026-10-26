@@ -13,6 +13,7 @@ import {
 import { Lecturer, Subject } from '../types';
 import { attendanceEngine } from '../services/attendanceEngine';
 import { soundService } from '../services/soundService';
+import { normalizeClassCode, toCanonicalClassCode } from '../utils/classHelper';
 
 interface SubjectGroupState {
   subjectId: string;
@@ -32,10 +33,10 @@ interface LecturerManageSubjectsModalProps {
 }
 
 const DEFAULT_CLASSES = [
-  'DIA_1A', 'DIA_1B',
-  'DIA_2A', 'DIA_2B',
-  'DIA_3A', 'DIA_3B', 'DIA_3C', 'DIA_3D',
-  'DIA_4A', 'DIA_4B', 'DIA_4C', 'DIA_4D'
+  'DIA1A', 'DIA1B',
+  'DIA2A', 'DIA2B',
+  'DIA3A', 'DIA3B', 'DIA3C', 'DIA3D',
+  'DIA4A', 'DIA4B', 'DIA4C', 'DIA4D'
 ];
 
 export const LecturerManageSubjectsModal: React.FC<LecturerManageSubjectsModalProps> = ({
@@ -57,13 +58,16 @@ export const LecturerManageSubjectsModal: React.FC<LecturerManageSubjectsModalPr
     const engineClasses = attendanceEngine.getUniqueClasses();
     const lecturerClasses = lecturer?.assignedClasses || lecturer?.assignedSections || [];
     const passedClasses = allClasses || [];
-    const pool = new Set<string>([
-      ...engineClasses,
-      ...lecturerClasses,
-      ...passedClasses,
-      ...DEFAULT_CLASSES
-    ]);
-    return Array.from(pool).filter(Boolean).sort();
+    const classMap = new Map<string, string>();
+    [...engineClasses, ...lecturerClasses, ...passedClasses, ...DEFAULT_CLASSES].forEach((c) => {
+      if (c && c.trim()) {
+        const norm = normalizeClassCode(c);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(c));
+        }
+      }
+    });
+    return Array.from(classMap.values()).sort();
   }, [lecturer, allClasses]);
 
   // Initialize selected subjects from current lecturer assignments
