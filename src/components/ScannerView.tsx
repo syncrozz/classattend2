@@ -1,0 +1,1960 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { Html5Qrcode } from 'html5-qrcode';
+import confetti from 'canvas-confetti';
+import { QRCodeSVG } from 'qrcode.react';
+import {
+  Student,
+  AttendanceSession,
+  AttendanceRecord,
+  ScanResult,
+  AttendanceMethod,
+  Lecturer,
+  TeachingAssignment,
+  Enrollment
+} from '../types';
+import { normalizeClassCode, areClassesMatching, isStudentInClasses } from '../utils/classHelper';
+import { soundService } from '../services/soundService';
+import {
+  getClassBadgeColor,
+  getInitials,
+  getStudentColor,
+  sortSessionsLatestFirst,
+  formatAbsentListForCopy,
+  normalizeStudentId,
+  stripStudentId,
+  findStudentById
+} from '../utils/studentUtils';
+import { filterAuthorizedSessions } from '../utils/sessionAuth';
+import {
+  exportScannedAttendeesOnlyToCSV,
+  exportSessionAttendanceToCSV,
+  generateAttendanceBackupJSON,
+  downloadCSV,
+  downloadJSON
+} from '../utils/csvHelper';
+import {
+  Camera,
+  CameraOff,
+  CheckCircle2,
+  AlertTriangle,
+  XCircle,
+  Volume2,
+  VolumeX,
+  Sparkles,
+  Users,
+  Search,
+  Clock,
+  ArrowRight,
+  ShieldAlert,
+  GraduationCap,
+  Gauge,
+  SlidersHorizontal,
+  Info,
+  Tv,
+  Check,
+  X,
+  HelpCircle,
+  Radio,
+  FileCheck,
+  Award,
+  BookOpen,
+  UserCheck,
+  UserX,
+  MessageSquare,
+  Copy,
+  QrCode,
+  Lock,
+  RotateCcw,
+  Download,
+  FileSpreadsheet,
+  HardDrive
+} from 'lucide-react';
+import { formatWhatsAppPhone } from '../utils/whatsappHelper';
+import { formatAbsentListText, formatDisplayDate, deriveSessionTargetStudents } from '../utils/absentHelper';
+import { ScannerSettingsModal, CustomPaceValues } from './ScannerSettingsModal';
+
+export type ScanPaceMode = 'RELAXED' | 'BALANCED' | 'FAST';
+
+export interface PaceConfig {
+  label: string;
+  fps: number;
+  cooldownMs: number;
+  sameCodeGraceMs: number;
+  desc: string;
+}
+
+export const PACE_CONFIGS: Record<ScanPaceMode, PaceConfig> = {
+  RELAXED: {
+    label: 'Santai (Selesa)',
+    fps: 4,
+    cooldownMs: 3500,
+    sameCodeGraceMs: 5000,
+    desc: '3.5s jeda • Masa mencukupi untuk pelajar alihkan kad tanpa ralat pendua'
+  },
+  BALANCED: {
+    label: 'Sederhana (Standard)',
+    fps: 5,
+    cooldownMs: 2500,
+    sameCodeGraceMs: 4000,
+    desc: '2.5s jeda • Kelajuan seimbang untuk barisan kelas biasa'
+  },
+  FAST: {
+    label: 'Pantas (Laju)',
+    fps: 8,
+    cooldownMs: 1000,
+    sameCodeGraceMs: 2000,
+    desc: '1s jeda • Imbasan kilat berterusan'
+  }
+};
+
+export function getActivePaceConfig(pace: ScanPaceMode): PaceConfig {
+  if (typeof window !== 'undefined') {
+    try {
+      const isCustom = localStorage.getItem('classattend_scan_pace_is_custom') === 'true';
+      if (isCustom) {
+        const fps = parseInt(localStorage.getItem('classattend_custom_fps') || '6', 10);
+        const cooldownSec = parseFloat(localStorage.getItem('classattend_custom_cooldown_sec') || '2.5');
+        const graceSec = parseFloat(localStorage.getItem('classattend_custom_grace_sec') || '4.0');
+        return {
+          label: `Kustom (${fps} FPS)`,
+          fps,
+          cooldownMs: Math.round(cooldownSec * 1000),
+          sameCodeGraceMs: Math.round(graceSec * 1000),
+          desc: `${cooldownSec.toFixed(1)}s jeda • ${fps} FPS kadar kamera kustom`
+        };
+      }
+    } catch {}
+  }
+  return PACE_CONFIGS[pace] || PACE_CONFIGS.FAST;
+}
+
+interface ScannerViewProps {
+  activeSession: AttendanceSession | null;
+  initialSessionId?: string;
+  allSessions: AttendanceSession[];
+  students: Student[];
+  attendanceRecords: AttendanceRecord[];
+  isAdmin: boolean;
+  activeLecturer?: Lecturer | null;
+  teachingAssignments?: TeachingAssignment[];
+  enrollments?: Enrollment[];
+  onRequestAdminAccess: (actionName?: string) => void;
+  onProcessScan: (qrString: string, method: AttendanceMethod, targetSessionId?: string) => ScanResult;
+  onGoToActivities: () => void;
+  onCloseSession?: (sessionId: string) => void;
+  onGoToLecturerWorkspace?: () => void;
+  onGoToReports?: () => void;
+  soundEnabled: boolean;
+  onToggleSound: (enabled: boolean) => void;
+}
+
+export const ScannerView: React.FC<ScannerViewProps> = ({
+  activeSession,
+  initialSessionId,
+  allSessions,
+  students,
+  attendanceRecords,
+  isAdmin,
+  activeLecturer,
+  teachingAssignments,
+  enrollments = [],
+  onRequestAdminAccess,
+  onProcessScan,
+  onGoToActivities,
+  onCloseSession,
+  onGoToLecturerWorkspace,
+  onGoToReports,
+  soundEnabled,
+  onToggleSound
+}) => {
+  // AUTHORITATIVE ACTIVE SESSIONS QUERY (SES v4.5 PHASE 4B.2-C)
+  // Authoritative criterion: status === 'OPEN'.
+  // Scoped strictly to authenticated lecturer (or all institutional open sessions for Admin).
+  // Historical sessions (CLOSED / ARCHIVED) are strictly excluded from the active switcher.
+  const activeOpenSessions = useMemo(() => {
+    const openOnly = allSessions.filter((s) => s.status === 'OPEN');
+    if (isAdmin) {
+      return sortSessionsLatestFirst(openOnly);
+    }
+    if (activeLecturer) {
+      const authorized = filterAuthorizedSessions(openOnly, activeLecturer, isAdmin, teachingAssignments || []);
+      if (authorized.length > 0) return authorized;
+    }
+    return sortSessionsLatestFirst(openOnly);
+  }, [allSessions, isAdmin, activeLecturer, teachingAssignments]);
+
+  const [selectedSessionId, setSelectedSessionId] = useState<string>(() => {
+    if (initialSessionId) {
+      const match = allSessions.find((s) => s.id === initialSessionId);
+      if (match) return match.id;
+    }
+    if (activeSession) {
+      return activeSession.id;
+    }
+    if (activeOpenSessions[0]) {
+      return activeOpenSessions[0].id;
+    }
+    return allSessions[0]?.id || '';
+  });
+  
+  // Tabs: 'CAMERA' | 'PROJECTOR_QR' | 'MANUAL'
+  const [scannerMode, setScannerMode] = useState<'CAMERA' | 'PROJECTOR_QR' | 'MANUAL'>('CAMERA');
+  
+  const [isCameraActive, setIsCameraActive] = useState<boolean>(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null);
+  const [manualInput, setManualInput] = useState<string>('');
+  const [cooldown, setCooldown] = useState<boolean>(false);
+  const [cooldownSecondsLeft, setCooldownSecondsLeft] = useState<number>(0);
+  const [selectedClassFilter, setSelectedClassFilter] = useState<string>('ALL');
+  
+  // Real-time ticking clock for live attendance
+  const [currentTime, setCurrentTime] = useState<Date>(new Date());
+  
+  // Close Session Confirmation & Summary Modals
+  const [isCloseModalOpen, setIsCloseModalOpen] = useState<boolean>(false);
+  const [closedSessionSummary, setClosedSessionSummary] = useState<{
+    sessionId: string;
+    sessionName: string;
+    subjectCode: string;
+    subjectName: string;
+    className: string;
+    date: string;
+    presentCount: number;
+    totalCount: number;
+    percentage: number;
+    absentList: Student[];
+  } | null>(null);
+
+  // Tab for active attendees view: 'PRESENT' (Hadir) vs 'ABSENT' (Belum Hadir)
+  const [attendanceListTab, setAttendanceListTab] = useState<'PRESENT' | 'ABSENT'>('PRESENT');
+  const [absentSearchQuery, setAbsentSearchQuery] = useState<string>('');
+  const [copiedAbsentList, setCopiedAbsentList] = useState<boolean>(false);
+  const [confirmManualStudentId, setConfirmManualStudentId] = useState<string | null>(null);
+
+  const [scanPace, setScanPace] = useState<ScanPaceMode>(() => {
+    try {
+      const saved = localStorage.getItem('classattend_scan_pace');
+      if (saved === 'RELAXED' || saved === 'BALANCED' || saved === 'FAST') {
+        return saved;
+      }
+    } catch (e) {}
+    return 'FAST';
+  });
+  const [isSettingsModalOpen, setIsSettingsModalOpen] = useState<boolean>(false);
+  const [currentVolume, setCurrentVolume] = useState<number>(() => soundService.getVolume());
+  const [copiedLink, setCopiedLink] = useState<boolean>(false);
+  const [backupToast, setBackupToast] = useState<string | null>(null);
+
+  const activePaceConfig = getActivePaceConfig(scanPace);
+
+  const html5QrCodeRef = useRef<Html5Qrcode | null>(null);
+  const qrRegionId = 'qr-reader-studentattend';
+
+  // Live clock ticker
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Refs to prevent React stale closures inside Html5Qrcode callbacks
+  const scanPaceRef = useRef<ScanPaceMode>(scanPace);
+  const lastScannedDataRef = useRef<string>('');
+  const lastScanTimeRef = useRef<number>(0);
+  const isProcessingRef = useRef<boolean>(false);
+  const cooldownTimerRef = useRef<any>(null);
+  const countdownIntervalRef = useRef<any>(null);
+  const selectedSessionIdRef = useRef<string>(selectedSessionId);
+  const onProcessScanRef = useRef(onProcessScan);
+  const soundEnabledRef = useRef(soundEnabled);
+
+  // Sync refs with latest state/props
+  useEffect(() => {
+    scanPaceRef.current = scanPace;
+  }, [scanPace]);
+
+  useEffect(() => {
+    selectedSessionIdRef.current = selectedSessionId;
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    onProcessScanRef.current = onProcessScan;
+  }, [onProcessScan]);
+
+  useEffect(() => {
+    soundEnabledRef.current = soundEnabled;
+  }, [soundEnabled]);
+
+  // Ensure selectedSessionId defaults to initialSessionId or activeSession, and stays bound to active or latest session
+  useEffect(() => {
+    if (initialSessionId) {
+      const match = allSessions.find((s) => s.id === initialSessionId);
+      if (match) {
+        setSelectedSessionId(initialSessionId);
+        return;
+      }
+    }
+    if (activeSession) {
+      setSelectedSessionId(activeSession.id);
+      return;
+    }
+
+    if (activeOpenSessions.length > 0) {
+      const isCurrentValid = activeOpenSessions.some((s) => s.id === selectedSessionId);
+      if (!isCurrentValid) {
+        setSelectedSessionId(activeOpenSessions[0].id);
+      }
+    } else if (allSessions.length > 0) {
+      const isCurrentValid = allSessions.some((s) => s.id === selectedSessionId);
+      if (!isCurrentValid) {
+        setSelectedSessionId(allSessions[0].id);
+      }
+    }
+  }, [initialSessionId, activeSession, activeOpenSessions, selectedSessionId, allSessions]);
+
+  // Current active session: strictly prioritize OPEN sessions from activeOpenSessions, but gracefully fallback to allSessions[0]
+  const currentSession = useMemo(() => {
+    if (selectedSessionId) {
+      const foundInOpen = activeOpenSessions.find((s) => s.id === selectedSessionId);
+      if (foundInOpen) return foundInOpen;
+      const foundInAll = allSessions.find((s) => s.id === selectedSessionId);
+      if (foundInAll) return foundInAll;
+    }
+    if (activeOpenSessions.length > 0) return activeOpenSessions[0];
+    return allSessions[0] || null;
+  }, [selectedSessionId, activeOpenSessions, allSessions]);
+
+  // Session attendance stats
+  const sessionRecords = currentSession
+    ? attendanceRecords.filter((r) => r.sessionId === currentSession.id && r.status === 'PRESENT')
+    : [];
+
+  // Strictly target students of the same class for Class/Lecture sessions
+  const sessionAllowedClasses = useMemo(() => {
+    if (!currentSession?.className || currentSession.className === 'ALL' || currentSession.className === 'SEMUA') {
+      return null;
+    }
+    return currentSession.className.split(/[,;|/]/).map((c) => c.trim().toUpperCase()).filter(Boolean);
+  }, [currentSession?.className]);
+
+  const targetStudents = useMemo(() => {
+    const effectiveSession = currentSession || allSessions[0] || null;
+    let list = deriveSessionTargetStudents(effectiveSession, students, enrollments);
+
+    if (selectedClassFilter !== 'ALL') {
+      const filtered = list.filter((s) => areClassesMatching(s.className, selectedClassFilter));
+      if (filtered.length > 0) {
+        return filtered;
+      }
+    }
+
+    if (list.length === 0 && students.length > 0) {
+      return students;
+    }
+
+    return list;
+  }, [currentSession, allSessions, students, enrollments, selectedClassFilter]);
+
+  // Present records strictly matching the target class / enrolled students (if class session)
+  const matchingPresentRecords = useMemo(() => {
+    if (targetStudents.length > 0) {
+      const targetIds = new Set(targetStudents.map((s) => s.id));
+      const targetCodes = new Set(targetStudents.map((s) => (s.studentId || '').trim().toUpperCase()));
+      return sessionRecords.filter((r) => {
+        const c = (r.studentId || '').trim().toUpperCase();
+        return targetIds.has(r.studentId) || targetCodes.has(c);
+      });
+    }
+
+    if (sessionAllowedClasses && sessionAllowedClasses.length > 0) {
+      return sessionRecords.filter((r) => {
+        const student = findStudentById(students, r.studentId) || students.find((s) => s.id === r.studentId || s.studentId === r.studentId);
+        return student && isStudentInClasses(student.className, sessionAllowedClasses);
+      });
+    }
+    if (currentSession?.className && currentSession.className !== 'ALL' && currentSession.className !== 'SEMUA') {
+      return sessionRecords.filter((r) => {
+        const student = findStudentById(students, r.studentId) || students.find((s) => s.id === r.studentId || s.studentId === r.studentId);
+        return student && areClassesMatching(student.className, currentSession.className);
+      });
+    }
+    if (selectedClassFilter !== 'ALL') {
+      return sessionRecords.filter((r) => {
+        const student = findStudentById(students, r.studentId) || students.find((s) => s.id === r.studentId || s.studentId === r.studentId);
+        return student && areClassesMatching(student.className, selectedClassFilter);
+      });
+    }
+    return sessionRecords;
+  }, [targetStudents, sessionRecords, sessionAllowedClasses, currentSession?.className, selectedClassFilter, students]);
+
+  // Total target count: prioritize targetStudents.length (if resolved), otherwise stored snapshot session.targetCount
+  const totalTargetCount = targetStudents.length > 0
+    ? targetStudents.length
+    : (typeof currentSession?.targetCount === 'number' && currentSession.targetCount > 0
+        ? currentSession.targetCount
+        : (students.length > 0 ? students.length : 0));
+
+  const percentage =
+    totalTargetCount > 0 ? Math.round((matchingPresentRecords.length / totalTargetCount) * 100) : 0;
+  
+  const isAllPresent = totalTargetCount > 0 && matchingPresentRecords.length >= totalTargetCount;
+
+  // Filtered session records based on class filter (Sorted latest-first)
+  const filteredSessionRecords = sessionRecords.filter((record) => {
+    if (selectedClassFilter === 'ALL') return true;
+    const student = findStudentById(students, record.studentId) || students.find((s) => s.id === record.studentId);
+    return student?.className.toUpperCase() === selectedClassFilter.toUpperCase();
+  }).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  // Set of student IDs recorded as PRESENT
+  const presentStudentIdsSet = useMemo(() => {
+    const set = new Set<string>();
+    matchingPresentRecords.forEach((r) => {
+      if (r.studentId) {
+        set.add(r.studentId.trim().toUpperCase());
+        set.add(normalizeStudentId(r.studentId));
+        set.add(stripStudentId(r.studentId));
+      }
+      const stu = findStudentById(students, r.studentId) || students.find((s) => s.id === r.studentId || s.studentId === r.studentId);
+      if (stu) {
+        if (stu.id) {
+          set.add(stu.id.trim().toUpperCase());
+          set.add(normalizeStudentId(stu.id));
+          set.add(stripStudentId(stu.id));
+        }
+        if (stu.studentId) {
+          set.add(stu.studentId.trim().toUpperCase());
+          set.add(normalizeStudentId(stu.studentId));
+          set.add(stripStudentId(stu.studentId));
+        }
+      }
+    });
+    return set;
+  }, [matchingPresentRecords, students]);
+
+  // Authoritative Absent Students list (targetStudents who are not in presentStudentIdsSet)
+  const absentStudents = useMemo(() => {
+    return targetStudents.filter((st) => {
+      const idUpper = (st.id || '').trim().toUpperCase();
+      const codeUpper = (st.studentId || '').trim().toUpperCase();
+      const idStripped = stripStudentId(st.id);
+      const codeStripped = stripStudentId(st.studentId);
+      const isPresent =
+        (idUpper && presentStudentIdsSet.has(idUpper)) ||
+        (codeUpper && presentStudentIdsSet.has(codeUpper)) ||
+        (idStripped && presentStudentIdsSet.has(idStripped)) ||
+        (codeStripped && presentStudentIdsSet.has(codeStripped));
+      return !isPresent;
+    });
+  }, [targetStudents, presentStudentIdsSet]);
+
+  const filteredAbsentStudents = useMemo(() => {
+    if (!absentSearchQuery.trim()) return absentStudents;
+    const q = absentSearchQuery.toLowerCase().trim();
+    const qStripped = stripStudentId(absentSearchQuery);
+    return absentStudents.filter((st) =>
+      st.name.toLowerCase().includes(q) ||
+      (qStripped.length >= 2 && stripStudentId(st.studentId).includes(qStripped)) ||
+      st.studentId.toLowerCase().includes(q) ||
+      st.className.toLowerCase().includes(q)
+    );
+  }, [absentStudents, absentSearchQuery]);
+
+  // Session status-based terminology (SES v4.4 Phase 3 standard)
+  // Active session = "Belum Hadir", Closed session = "Tidak Hadir"
+  const isSessionClosed = currentSession?.status !== 'OPEN';
+  const absentLabel = isSessionClosed ? 'Tidak Hadir' : 'Belum Hadir';
+
+  // Safe manual attendance handler with light confirmation to prevent accidental taps
+  const handleManualMarkClick = (studentId: string) => {
+    if (confirmManualStudentId === studentId) {
+      handleScannedData(studentId, 'MANUAL_OVERRIDE');
+      setConfirmManualStudentId(null);
+    } else {
+      setConfirmManualStudentId(studentId);
+      setTimeout(() => {
+        setConfirmManualStudentId((prev) => (prev === studentId ? null : prev));
+      }, 3500);
+    }
+  };
+
+  // Core scan execution with smart duplicate protection and dynamic cooldown
+  const handleScannedData = useCallback((dataString: string, method: AttendanceMethod = 'CAMERA_SCAN') => {
+    const now = Date.now();
+    const pace = getActivePaceConfig(scanPaceRef.current);
+
+    // 1. SMART DUPLICATE PROTECTION:
+    // If the exact same QR code was scanned within the sameCodeGraceMs window (e.g. 5 seconds),
+    // silently ignore it. This prevents the camera from triggering duplicate errors while the student is lowering or moving the card away!
+    if (
+      lastScannedDataRef.current === dataString &&
+      now - lastScanTimeRef.current < pace.sameCodeGraceMs
+    ) {
+      return;
+    }
+
+    // 2. GENERAL PACE THROTTLE:
+    if (isProcessingRef.current || (now - lastScanTimeRef.current < pace.cooldownMs && lastScanTimeRef.current > 0)) {
+      return;
+    }
+
+    // Lock processing
+    isProcessingRef.current = true;
+    lastScannedDataRef.current = dataString;
+    lastScanTimeRef.current = now;
+
+    // Trigger visual cooldown & countdown timer
+    setCooldown(true);
+    const totalCooldownSec = Math.round(pace.cooldownMs / 1000);
+    setCooldownSecondsLeft(totalCooldownSec);
+
+    // Clear previous timers
+    if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
+    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+
+    let remaining = totalCooldownSec;
+    countdownIntervalRef.current = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(countdownIntervalRef.current);
+        setCooldownSecondsLeft(0);
+      } else {
+        setCooldownSecondsLeft(remaining);
+      }
+    }, 1000);
+
+    cooldownTimerRef.current = setTimeout(() => {
+      isProcessingRef.current = false;
+      setCooldown(false);
+      setCooldownSecondsLeft(0);
+    }, pace.cooldownMs);
+
+    // Process scan via attendanceEngine
+    const result = onProcessScanRef.current(dataString, method, selectedSessionIdRef.current);
+    setScanResult(result);
+
+    // Audio & Visual feedback
+    if (result.success) {
+      if (soundEnabledRef.current) soundService.playSuccess();
+      try {
+        confetti({
+          particleCount: 40,
+          spread: 60,
+          origin: { y: 0.8 },
+          colors: ['#10b981', '#6366f1', '#38bdf8']
+        });
+      } catch (e) {}
+    } else if (result.isDuplicate) {
+      if (soundEnabledRef.current) soundService.playDuplicate();
+    } else {
+      if (soundEnabledRef.current) soundService.playError();
+    }
+  }, []);
+
+  // Start Camera
+  const startCamera = async () => {
+    soundService.unlockAudio();
+    setCameraError(null);
+    try {
+      if (!html5QrCodeRef.current) {
+        html5QrCodeRef.current = new Html5Qrcode(qrRegionId);
+      }
+
+      const activeConfig = getActivePaceConfig(scanPaceRef.current);
+
+      await html5QrCodeRef.current.start(
+        { facingMode: 'environment' },
+        {
+          fps: activeConfig.fps,
+          qrbox: { width: 260, height: 260 },
+          aspectRatio: 1.0
+        },
+        (decodedText) => {
+          handleScannedData(decodedText, 'CAMERA_SCAN');
+        },
+        () => {}
+      );
+
+      setIsCameraActive(true);
+    } catch (err: any) {
+      console.warn('Camera start error:', err);
+      setCameraError('Kamera tidak dapat digunakan pada peranti ini. Sila benarkan akses kamera pada pelayar atau gunakan tab Input Manual.');
+      setIsCameraActive(false);
+    }
+  };
+
+  // Stop Camera
+  const stopCamera = async () => {
+    if (html5QrCodeRef.current && isCameraActive) {
+      try {
+        await html5QrCodeRef.current.stop();
+        setIsCameraActive(false);
+      } catch (err) {
+        console.warn('Camera stop error:', err);
+      }
+    }
+  };
+
+  // Restart camera when user changes FPS pace if camera is running
+  const handlePaceChange = async (newPace: ScanPaceMode, customValues?: CustomPaceValues) => {
+    setScanPace(newPace);
+    scanPaceRef.current = newPace;
+    try {
+      localStorage.setItem('classattend_scan_pace', newPace);
+      if (customValues) {
+        localStorage.setItem('classattend_scan_pace_is_custom', 'true');
+        localStorage.setItem('classattend_custom_fps', String(customValues.fps));
+        localStorage.setItem('classattend_custom_cooldown_sec', String(customValues.cooldownMs / 1000));
+        localStorage.setItem('classattend_custom_grace_sec', String(customValues.sameCodeGraceMs / 1000));
+      } else {
+        localStorage.setItem('classattend_scan_pace_is_custom', 'false');
+      }
+    } catch (e) {}
+
+    isProcessingRef.current = false;
+    setCooldown(false);
+    setCooldownSecondsLeft(0);
+
+    if (isCameraActive && html5QrCodeRef.current) {
+      try {
+        await html5QrCodeRef.current.stop();
+        const activeConfig = getActivePaceConfig(newPace);
+        await html5QrCodeRef.current.start(
+          { facingMode: 'environment' },
+          {
+            fps: activeConfig.fps,
+            qrbox: { width: 260, height: 260 },
+            aspectRatio: 1.0
+          },
+          (decodedText) => {
+            handleScannedData(decodedText, 'CAMERA_SCAN');
+          },
+          () => {}
+        );
+      } catch (e) {
+        console.warn('Restart camera error on pace change:', e);
+      }
+    }
+  };
+
+  // Auto-start camera when scanner mounts in CAMERA mode with an active session
+  useEffect(() => {
+    let isMounted = true;
+    if (scannerMode === 'CAMERA' && currentSession?.status === 'OPEN' && !isCameraActive && !cameraError) {
+      const timer = setTimeout(() => {
+        if (isMounted && !isCameraActive) {
+          startCamera();
+        }
+      }, 350);
+      return () => {
+        isMounted = false;
+        clearTimeout(timer);
+      };
+    }
+  }, [scannerMode, currentSession?.id, currentSession?.status]);
+
+  useEffect(() => {
+    return () => {
+      if (html5QrCodeRef.current && html5QrCodeRef.current.isScanning) {
+        html5QrCodeRef.current.stop().catch(console.warn);
+      }
+      if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+    };
+  }, []);
+
+  // Manual code entry / student selection
+  const handleManualSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!manualInput.trim()) return;
+    const normalizedInput = normalizeStudentId(manualInput.trim());
+    handleScannedData(normalizedInput, 'MANUAL');
+    setManualInput('');
+  };
+
+  // Quick student match list
+  const filteredQuickList = students
+    .filter((s) => {
+      const rawQ = manualInput.trim();
+      if (!rawQ) return false;
+      const qLower = rawQ.toLowerCase();
+      const qNormalized = normalizeStudentId(rawQ).toLowerCase();
+      const qStripped = stripStudentId(rawQ).toLowerCase();
+
+      const sName = s.name.toLowerCase();
+      const sId = (s.studentId || s.id).toLowerCase();
+      const sIdStripped = stripStudentId(s.studentId || s.id).toLowerCase();
+      const sClass = s.className.toLowerCase();
+
+      return (
+        sName.includes(qLower) ||
+        sId.includes(qLower) ||
+        sId.includes(qNormalized) ||
+        sIdStripped.includes(qStripped) ||
+        sClass.includes(qLower)
+      );
+    })
+    .slice(0, 6);
+
+  // Backup Scanned Attendance Handlers
+  const handleBackupSessionCSV = () => {
+    if (!currentSession) return;
+    const content = exportScannedAttendeesOnlyToCSV(currentSession, students, attendanceRecords);
+    const dateStr = currentSession.date || new Date().toISOString().split('T')[0];
+    const subStr = (currentSession.subjectCode || currentSession.sessionName || 'Kelas').replace(/[\s/]/g, '_');
+    const classStr = (currentSession.className || 'Semua').replace(/[\s/]/g, '_');
+    const filename = `Backup_Kehadiran_${subStr}_${classStr}_${dateStr}.csv`;
+    downloadCSV(content, filename);
+    setBackupToast(`Backup CSV (${matchingPresentRecords.length} pelajar hadir) berjaya dimuat turun!`);
+    setTimeout(() => setBackupToast(null), 4000);
+  };
+
+  const handleBackupSessionJSON = () => {
+    if (!currentSession) return;
+    const sessionRecords = attendanceRecords.filter((r) => r.sessionId === currentSession.id);
+    const content = generateAttendanceBackupJSON(sessionRecords, students, [currentSession], currentSession.lecturerName);
+    const dateStr = currentSession.date || new Date().toISOString().split('T')[0];
+    const subStr = (currentSession.subjectCode || currentSession.sessionName || 'Kelas').replace(/[\s/]/g, '_');
+    const filename = `Backup_Penuh_Kehadiran_${subStr}_${dateStr}.json`;
+    downloadJSON(content, filename);
+    setBackupToast('Backup JSON lengkap berjaya dimuat turun!');
+    setTimeout(() => setBackupToast(null), 4000);
+  };
+
+  // Close Session Handler
+  const handleConfirmCloseSession = () => {
+    if (!currentSession) return;
+    setIsCloseModalOpen(false);
+
+    const summary = {
+      sessionId: currentSession.id,
+      sessionName: currentSession.sessionName,
+      subjectCode: currentSession.subjectCode || 'KULIAH',
+      subjectName: currentSession.subjectName || '',
+      className: currentSession.className || 'Semua',
+      date: currentSession.date || new Date().toISOString().split('T')[0],
+      presentCount: matchingPresentRecords.length,
+      totalCount: targetStudents.length,
+      percentage: percentage,
+      absentList: absentStudents
+    };
+
+    setClosedSessionSummary(summary);
+
+    if (onCloseSession) {
+      onCloseSession(currentSession.id);
+    }
+    soundService.playSuccess();
+  };
+
+  return (
+    <div id="live-attendance-container" className="space-y-6 animate-fadeIn">
+      {/* 1. FIRST VIEWPORT: LIVE ATTENDANCE HEADER & METRIC BAR */}
+      <div
+        id="live-attendance-header-banner"
+        className="rounded-3xl bg-slate-900 border border-slate-800 p-4 sm:p-6 shadow-2xl relative overflow-hidden space-y-4"
+      >
+        {/* Ambient Top Glow */}
+        <div className="absolute top-0 right-1/4 w-96 h-32 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
+
+        {/* Header Row: Live Status, Subject, Class, Clock, Controls */}
+        <div className="flex flex-wrap items-center justify-between gap-3 relative z-10">
+          <div className="flex flex-wrap items-center gap-2.5">
+            {currentSession?.status === 'OPEN' ? (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-black tracking-wider uppercase shadow-sm">
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
+                <span>LIVE KEHADIRAN</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700 text-xs font-bold uppercase">
+                <Lock className="w-3 h-3" />
+                <span>SESI SELESAI</span>
+              </span>
+            )}
+
+            {currentSession?.className && (
+              <span className={`px-3 py-1 rounded-xl text-xs font-black border tracking-wide ${getClassBadgeColor(currentSession.className)}`}>
+                Kelas {currentSession.className}
+              </span>
+            )}
+
+            {currentSession?.subjectCode && (
+              <span className="px-2.5 py-1 rounded-xl bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono font-extrabold text-xs">
+                {currentSession.subjectCode}
+              </span>
+            )}
+          </div>
+
+          {/* Right Side: Live Clock, Sound Controls, Tamatkan Sesi */}
+          <div className="flex items-center gap-2">
+            {/* Live Clock */}
+            <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-950/80 border border-slate-800 text-slate-300 text-xs font-mono">
+              <Clock className="w-3.5 h-3.5 text-emerald-400" />
+              <span>
+                {currentTime.toLocaleTimeString('ms-MY', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit'
+                })}
+              </span>
+            </div>
+
+            {/* Sound Toggle */}
+            <button
+              type="button"
+              id="btn-toggle-sound"
+              onClick={() => onToggleSound(!soundEnabled)}
+              className={`p-2 rounded-xl border text-xs font-semibold cursor-pointer transition-all ${
+                soundEnabled ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/30' : 'bg-slate-950 border-slate-800 text-slate-500 hover:text-slate-300'
+              }`}
+              title={soundEnabled ? 'Matikan Bunyi Imbasan' : 'Aktifkan Bunyi Imbasan'}
+            >
+              {soundEnabled ? <Volume2 className="w-4 h-4 text-indigo-400" /> : <VolumeX className="w-4 h-4" />}
+            </button>
+
+            {/* Admin Settings (Hidden for regular lecturers to prevent distraction) */}
+            {isAdmin && (
+              <button
+                type="button"
+                id="btn-scanner-settings-header"
+                onClick={() => setIsSettingsModalOpen(true)}
+                className="px-2.5 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+                title="Tetapan Kelajuan & Audio Pengimbas"
+              >
+                <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Pace & Audio</span>
+              </button>
+            )}
+
+            {/* Primary Action: Tamatkan Sesi */}
+            {currentSession?.status === 'OPEN' && (
+              <button
+                type="button"
+                id="btn-close-session-header"
+                onClick={() => setIsCloseModalOpen(true)}
+                className="min-h-[40px] px-4 py-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 text-white border border-rose-500/40 text-xs font-extrabold shadow-md shadow-rose-900/30 transition-all flex items-center gap-2 cursor-pointer active:scale-95"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>Tamatkan Sesi</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Subject Name & Details */}
+        <div className="space-y-1 relative z-10">
+          <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
+            {currentSession?.subjectName
+              ? `${currentSession.subjectCode ? `${currentSession.subjectCode} — ` : ''}${currentSession.subjectName}`
+              : currentSession?.sessionName || 'Sesi Kehadiran'}
+          </h2>
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
+            <span>Pensyarah: <strong className="text-slate-200">{currentSession?.lecturerName || 'Pensyarah Kursus'}</strong></span>
+            <span>•</span>
+            <span>Tarikh: <strong className="text-slate-200">{currentSession?.date || currentTime.toISOString().split('T')[0]}</strong></span>
+            {currentSession?.className && (
+              <>
+                <span>•</span>
+                <span>Kelas: <strong className="text-indigo-300">{currentSession.className}</strong></span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* PRIMARY REAL-TIME ATTENDANCE METRIC BAR (MYAU Focus) */}
+        <div
+          id="real-time-attendance-metric-card"
+          className="p-4 sm:p-5 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-3 relative z-10"
+        >
+          <div className="flex flex-wrap items-end justify-between gap-2">
+            <div>
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+                <Users className="w-3.5 h-3.5 text-indigo-400" />
+                <span>STATUS KEHADIRAN KELAS</span>
+              </div>
+              <div className="text-2xl sm:text-3xl font-black text-white font-mono tracking-tight flex items-baseline gap-2 pt-0.5">
+                <span className="text-emerald-400">{matchingPresentRecords.length}</span>
+                <span className="text-slate-500 text-lg sm:text-xl">
+                  / {totalTargetCount > 0 ? totalTargetCount : (targetStudents.length > 0 ? targetStudents.length : (students.length > 0 ? students.length : 0))} HADIR
+                </span>
+                <span className="text-xs font-sans font-bold px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  {percentage}%
+                </span>
+              </div>
+            </div>
+
+            {/* 100% Completion Badge or Absent Count */}
+            {isAllPresent ? (
+              <div className="px-3.5 py-1.5 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-black flex items-center gap-2 animate-bounce">
+                <Award className="w-4 h-4 text-emerald-400" />
+                <span>SEMUA PELAJAR DIREKODKAN (100%)</span>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setAttendanceListTab('ABSENT')}
+                className="text-xs text-rose-300 hover:text-rose-200 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-3 py-1.5 rounded-xl font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <UserX className="w-3.5 h-3.5 text-rose-400" />
+                <span>{absentStudents.length} Pelajar {absentLabel} &rarr;</span>
+              </button>
+            )}
+          </div>
+
+          {/* Smooth High-Contrast Progress Bar */}
+          <div className="w-full bg-slate-900 h-3 rounded-full overflow-hidden p-0.5 border border-slate-800">
+            <div
+              className={`h-full rounded-full transition-all duration-500 ${
+                isAllPresent
+                  ? 'bg-gradient-to-r from-emerald-500 to-teal-400 shadow-md shadow-emerald-500/50'
+                  : percentage >= 75
+                  ? 'bg-gradient-to-r from-emerald-500 to-emerald-400'
+                  : percentage >= 50
+                  ? 'bg-gradient-to-r from-indigo-500 to-emerald-400'
+                  : 'bg-gradient-to-r from-amber-500 to-indigo-500'
+              }`}
+              style={{ width: `${Math.min(100, Math.max(percentage, 2))}%` }}
+            />
+          </div>
+        </div>
+
+        {/* Session Switcher Selector: Only displayed if multiple active sessions exist */}
+        {activeOpenSessions.length > 1 && (
+          <div className="pt-2 border-t border-slate-800/60 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 flex-1 min-w-[240px]">
+              <span className="text-slate-400 font-semibold whitespace-nowrap">Tukar Sesi:</span>
+              <select
+                id="select-active-session-switch"
+                value={selectedSessionId}
+                onChange={(e) => setSelectedSessionId(e.target.value)}
+                className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+              >
+                {activeOpenSessions.map((ses) => {
+                  const subCode = (ses.subjectCode || '').trim();
+                  const sName = (ses.sessionName || '').trim();
+                  const cName = (ses.className || '').trim();
+                  const title = sName.toUpperCase().includes(subCode.toUpperCase())
+                    ? sName
+                    : `${subCode ? `${subCode} - ` : ''}${sName}`;
+                  const classSuffix = cName && !sName.toUpperCase().includes(cName.toUpperCase()) ? ` (${cName})` : '';
+                  return (
+                    <option key={ses.id} value={ses.id}>
+                      [AKTIF] {title}{classSuffix} • {ses.date}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+
+            <button
+              type="button"
+              onClick={onGoToActivities}
+              className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer"
+            >
+              <span>Semua Sesi & Kelas</span>
+              <ArrowRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* 2. MODE SELECTOR TABS (Camera / Projector QR / Manual Search) */}
+      <div className="flex items-center bg-slate-900/80 p-1.5 rounded-2xl border border-slate-800 shadow-inner">
+        <button
+          type="button"
+          id="tab-mode-camera"
+          onClick={() => setScannerMode('CAMERA')}
+          className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+            scannerMode === 'CAMERA'
+              ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
+              : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+          }`}
+        >
+          <Camera className="w-4 h-4" />
+          <span>Kamera Pensyarah</span>
+        </button>
+
+        <button
+          type="button"
+          id="tab-mode-projector"
+          onClick={() => setScannerMode('PROJECTOR_QR')}
+          className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+            scannerMode === 'PROJECTOR_QR'
+              ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
+              : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+          }`}
+        >
+          <Tv className="w-4 h-4" />
+          <span>Paparan QR Projektor (Pelajar Imbas)</span>
+        </button>
+
+        <button
+          type="button"
+          id="tab-mode-manual"
+          onClick={() => setScannerMode('MANUAL')}
+          className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+            scannerMode === 'MANUAL'
+              ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
+              : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
+          }`}
+        >
+          <Search className="w-4 h-4" />
+          <span>Carian & Input Manual</span>
+        </button>
+      </div>
+
+      {/* 3. MAIN INTERACTION GRID: SCANNER WORKSPACE + LIVE ATTENDANCE LOG */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* LEFT COLUMN: ACTIVE SCANNER VIEWPORT (7 COLS) */}
+        <div className="lg:col-span-7 space-y-4">
+          {/* TAB 1: CAMERA SCANNER */}
+          {scannerMode === 'CAMERA' && (
+            <div className="rounded-3xl bg-slate-900 border border-slate-800 p-5 space-y-4 shadow-xl">
+              <div className="flex items-center justify-between">
+                <div className="flex flex-wrap items-center gap-2">
+                  <Camera className="w-4 h-4 text-indigo-400" />
+                  <h3 className="text-sm font-bold text-white">Kamera Pengimbas QR</h3>
+                  <button
+                    type="button"
+                    id="btn-camera-pace-badge"
+                    onClick={() => {
+                      if (!isAdmin) {
+                        onRequestAdminAccess('Tetapan Kelajuan & Audio Pengimbas');
+                      }
+                      setIsSettingsModalOpen(true);
+                    }}
+                    className="px-2 py-0.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold border border-slate-700 flex items-center gap-1 cursor-pointer transition-colors"
+                    title="Ubah kadar kelajuan imbasan (Pace) atau kelantangan bunyi"
+                  >
+                    <Gauge className="w-3 h-3 text-indigo-400" />
+                    <span>Pace: {activePaceConfig.label.split(' ')[0]} ({activePaceConfig.fps} FPS)</span>
+                  </button>
+                </div>
+                <div className="flex items-center gap-2">
+                  {!isCameraActive ? (
+                    <button
+                      type="button"
+                      id="scanner-btn-start-camera"
+                      onClick={startCamera}
+                      className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold shadow-md shadow-emerald-600/30 transition-all cursor-pointer active:scale-95"
+                    >
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>Aktifkan Kamera</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      id="scanner-btn-stop-camera"
+                      onClick={stopCamera}
+                      className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-slate-800 hover:bg-rose-600/20 text-slate-300 hover:text-rose-300 border border-slate-700 text-xs font-semibold transition-all cursor-pointer"
+                    >
+                      <CameraOff className="w-3.5 h-3.5" />
+                      <span>Hentikan Kamera</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Informational banner when no session is active */}
+              {!currentSession && (
+                <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-300 text-xs flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                    <span>Tiada sesi kelas yang aktif. Buka sesi di Workspace Pensyarah untuk merakam kehadiran.</span>
+                  </div>
+                  {onGoToLecturerWorkspace && (
+                    <button
+                      type="button"
+                      onClick={onGoToLecturerWorkspace}
+                      className="px-3 py-1 rounded-xl bg-amber-600 hover:bg-amber-500 text-white font-bold text-xs whitespace-nowrap cursor-pointer"
+                    >
+                      Workspace Pensyarah
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {/* Video Viewport Container */}
+              <div
+                className={`relative rounded-2xl overflow-hidden bg-slate-950 border transition-all min-h-[320px] flex items-center justify-center ${
+                  cooldown ? 'border-emerald-500/60 shadow-lg shadow-emerald-500/10' : 'border-slate-800'
+                }`}
+              >
+                <div id={qrRegionId} className="w-full max-w-sm"></div>
+
+                {!isCameraActive && (
+                  <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-slate-950/95 space-y-3">
+                    <div className="w-16 h-16 rounded-2xl bg-indigo-500/10 border border-indigo-500/30 flex items-center justify-center text-indigo-400">
+                      <Camera className="w-8 h-8" />
+                    </div>
+                    <div className="space-y-1 max-w-xs">
+                      <h4 className="text-sm font-bold text-white">Kamera Belum Diaktifkan</h4>
+                      <p className="text-xs text-slate-400">
+                        Halakan kamera ke Kod QR Pelajar untuk merekod kehadiran secara serta-merta.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 pt-2">
+                      <button
+                        type="button"
+                        onClick={startCamera}
+                        className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-lg shadow-emerald-900/40 transition-all cursor-pointer"
+                      >
+                        Buka Kamera Sekarang
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setScannerMode('MANUAL')}
+                        className="px-3.5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs transition-all cursor-pointer"
+                      >
+                        Input Manual
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* Cooldown Overlay */}
+                {isCameraActive && cooldown && (
+                  <div className="absolute top-3 right-3 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-600/90 backdrop-blur-md text-white text-[11px] font-bold shadow-lg animate-pulse border border-emerald-400/40">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    <span>Kad Direkod • Sedia dalam {cooldownSecondsLeft}s</span>
+                  </div>
+                )}
+
+                {/* Ready Indicator */}
+                {isCameraActive && !cooldown && (
+                  <div className="absolute top-3 right-3 px-2.5 py-1 rounded-full bg-slate-900/80 backdrop-blur-md text-indigo-300 border border-indigo-500/30 text-[10px] font-semibold flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+                    <span>Sedia Mengimbas</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Camera Error Recovery Message */}
+              {cameraError && (
+                <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-300 text-xs space-y-2">
+                  <div className="flex items-center gap-2 font-bold text-rose-200">
+                    <AlertTriangle className="w-4 h-4 shrink-0 text-rose-400" />
+                    <span>{cameraError}</span>
+                  </div>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setScannerMode('MANUAL')}
+                      className="px-3 py-1.5 rounded-lg bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs transition-colors cursor-pointer"
+                    >
+                      Gunakan Input Manual
+                    </button>
+                    <button
+                      type="button"
+                      onClick={startCamera}
+                      className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold text-xs transition-colors cursor-pointer"
+                    >
+                      Cuba Buka Semula
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Fast Manual Search Under Camera */}
+              <div className="pt-2 border-t border-slate-800/80">
+                <form onSubmit={handleManualSubmit} className="space-y-2">
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span className="font-semibold">Carian Pantas No. Pelajar / Nama:</span>
+                    <span className="text-[10px] text-slate-500">Cth: PDA-2502-005</span>
+                  </div>
+                  <div className="flex gap-2">
+                    <div className="relative flex-1">
+                      <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                      <input
+                        id="scanner-quick-input"
+                        type="text"
+                        placeholder="No. Pelajar atau Nama..."
+                        value={manualInput}
+                        onChange={(e) => setManualInput(e.target.value)}
+                        className="w-full pl-9 pr-3 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-indigo-600 text-slate-200 hover:text-white font-bold text-xs border border-slate-700 transition-all cursor-pointer"
+                    >
+                      Sahkan
+                    </button>
+                  </div>
+                </form>
+
+                {/* Auto-suggest dropdown */}
+                {filteredQuickList.length > 0 && (
+                  <div className="mt-2 p-2 rounded-xl bg-slate-950 border border-slate-800 space-y-1">
+                    {filteredQuickList.map((st) => (
+                      <button
+                        key={st.id}
+                        type="button"
+                        onClick={() => {
+                          handleScannedData(st.id, 'MANUAL_OVERRIDE');
+                          setManualInput('');
+                        }}
+                        className="w-full flex items-center justify-between p-2 rounded-lg hover:bg-slate-900 text-left transition-all cursor-pointer group"
+                      >
+                        <div className="flex items-center gap-2">
+                          <div className={`w-6 h-6 rounded flex items-center justify-center text-[10px] font-bold ${getStudentColor(st.id)}`}>
+                            {getInitials(st.name)}
+                          </div>
+                          <div>
+                            <div className="text-xs font-semibold text-white group-hover:text-indigo-300">{st.name}</div>
+                            <div className="text-[10px] text-slate-400">{st.studentId} • {st.className}</div>
+                          </div>
+                        </div>
+                        <span className="text-xs font-bold text-emerald-400 group-hover:underline">Tanda Hadir &rarr;</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* TAB 2: PROJECTOR QR CODE FOR STUDENTS TO SCAN */}
+          {scannerMode === 'PROJECTOR_QR' && currentSession && (() => {
+            const studentWebUrl = typeof window !== 'undefined'
+              ? `${window.location.origin}${window.location.pathname}#attend?session=${currentSession.id}&subject=${encodeURIComponent(currentSession.subjectCode || '')}&class=${encodeURIComponent(currentSession.className || '')}&lecturer=${encodeURIComponent(currentSession.lecturerName || '')}&subjectName=${encodeURIComponent(currentSession.subjectName || '')}`
+              : `CLASSATTEND_SESSION|${currentSession.id}|${currentSession.subjectCode || ''}|${currentSession.className || ''}`;
+
+            return (
+              <div className="rounded-3xl bg-slate-900 border border-slate-800 p-6 space-y-5 text-center shadow-xl">
+                <div className="space-y-1">
+                  <span className="px-3 py-1 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-xs font-extrabold uppercase">
+                    Paparan Skrin Kelas / Projektor
+                  </span>
+                  <h3 className="text-lg font-black text-white pt-2">Imbas Kod QR Untuk Hadir</h3>
+                  <p className="text-xs text-slate-400 max-w-sm mx-auto">
+                    Pelajar boleh menghalakan kamera telefon ke kod QR di bawah untuk mengesahkan kehadiran kelas secara langsung.
+                  </p>
+                </div>
+
+                {/* Large Crisp QR Code */}
+                <div className="inline-block p-5 bg-white rounded-3xl shadow-2xl border-4 border-indigo-500/30">
+                  <QRCodeSVG
+                    value={studentWebUrl}
+                    size={240}
+                    level="H"
+                    includeMargin={true}
+                  />
+                </div>
+
+                {/* Quick Share Link & Test Actions */}
+                <div className="max-w-md mx-auto flex flex-col sm:flex-row items-center justify-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                        navigator.clipboard.writeText(studentWebUrl);
+                        setCopiedLink(true);
+                        setTimeout(() => setCopiedLink(false), 3000);
+                      }
+                    }}
+                    className="w-full sm:w-auto px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold border border-slate-700 transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                  >
+                    <span>{copiedLink ? '✓ Pautan Disalin!' : '📋 Salin Pautan Kelas (WhatsApp / Telegram)'}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    id="btn-test-student-checkin"
+                    onClick={() => {
+                      window.location.hash = `#attend?session=${currentSession.id}&subject=${encodeURIComponent(currentSession.subjectCode || '')}&class=${encodeURIComponent(currentSession.className || '')}&lecturer=${encodeURIComponent(currentSession.lecturerName || '')}&subjectName=${encodeURIComponent(currentSession.subjectName || '')}`;
+                    }}
+                    className="w-full sm:w-auto px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-lg shadow-indigo-600/30 active:scale-95"
+                  >
+                    <span>🧪 Uji Paparan Pelajar (Buka Sini)</span>
+                  </button>
+                </div>
+
+                {/* Session Meta on Projector */}
+                <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 max-w-md mx-auto flex items-center justify-around text-xs">
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase font-semibold">Subjek</div>
+                    <strong className="text-indigo-300 font-mono">{currentSession.subjectCode || 'KULIAH'}</strong>
+                  </div>
+                  <div className="h-6 w-px bg-slate-800" />
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase font-semibold">Kelas</div>
+                    <strong className="text-emerald-400">{currentSession.className || 'Semua'}</strong>
+                  </div>
+                  <div className="h-6 w-px bg-slate-800" />
+                  <div>
+                    <div className="text-[10px] text-slate-400 uppercase font-semibold">Terkumpul</div>
+                    <strong className="text-white font-mono">{matchingPresentRecords.length} / {totalTargetCount > 0 ? totalTargetCount : (targetStudents.length || students.length || 0)}</strong>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Fallback for Projector QR when no session is active */}
+          {scannerMode === 'PROJECTOR_QR' && !currentSession && (
+            <div className="rounded-3xl bg-slate-900 border border-slate-800 p-8 space-y-4 text-center shadow-xl">
+              <Tv className="w-12 h-12 text-slate-600 mx-auto" />
+              <h3 className="text-base font-bold text-white">Tiada Sesi Kehadiran Aktif</h3>
+              <p className="text-xs text-slate-400 max-w-sm mx-auto">
+                Sila buka atau aktifkan sesi kelas baharu melalui Workspace Pensyarah untuk memaparkan kod QR projektor kepada pelajar.
+              </p>
+              {onGoToLecturerWorkspace && (
+                <button
+                  type="button"
+                  onClick={onGoToLecturerWorkspace}
+                  className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-all cursor-pointer inline-flex items-center gap-2"
+                >
+                  <span>Buka Workspace Pensyarah</span>
+                  <ArrowRight className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* TAB 3: FULL MANUAL ENTRY & STUDENT DIRECTORY CHECK-IN */}
+          {scannerMode === 'MANUAL' && (
+            <div className="rounded-3xl bg-slate-900 border border-slate-800 p-5 space-y-4 shadow-xl">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Search className="w-4 h-4 text-indigo-400" />
+                  <h3 className="text-sm font-bold text-white">Carian & Input No. Pelajar</h3>
+                </div>
+                <span className="text-[11px] text-slate-400">
+                  {totalTargetCount > 0 ? totalTargetCount : (targetStudents.length || students.length || 0)} Pelajar Berdaftar
+                </span>
+              </div>
+
+              <form onSubmit={handleManualSubmit} className="space-y-2">
+                <div className="flex gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                    <input
+                      id="scanner-full-manual-input"
+                      type="text"
+                      placeholder="Masukkan No. Pelajar atau Nama..."
+                      value={manualInput}
+                      onChange={(e) => setManualInput(e.target.value)}
+                      className="w-full pl-9 pr-3 py-3 rounded-2xl bg-slate-950 border border-slate-800 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    className="px-5 py-3 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs shadow-lg shadow-indigo-600/30 transition-all cursor-pointer"
+                  >
+                    Sahkan Kehadiran
+                  </button>
+                </div>
+              </form>
+
+              {/* Roster of Students for One-Click Attendance */}
+              <div className="space-y-1.5 max-h-[360px] overflow-y-auto pr-1">
+                <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider pb-1">
+                  Senarai Pelajar Kelas {currentSession?.className || ''}
+                </div>
+                {targetStudents.map((st) => {
+                  const isPresent = sessionRecords.some((r) => r.studentId === st.id);
+                  return (
+                    <div
+                      key={st.id}
+                      className={`flex items-center justify-between p-2.5 rounded-xl border transition-all text-xs ${
+                        isPresent
+                          ? 'bg-emerald-950/20 border-emerald-500/30'
+                          : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2.5 min-w-0">
+                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold shrink-0 ${getStudentColor(st.id)}`}>
+                          {getInitials(st.name)}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="font-bold text-white truncate">{st.name}</div>
+                          <div className="text-[10px] text-slate-400 font-mono">{st.studentId} • {st.className}</div>
+                        </div>
+                      </div>
+
+                      {isPresent ? (
+                        <span className="px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold uppercase flex items-center gap-1">
+                          <Check className="w-3 h-3" />
+                          <span>Hadir</span>
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => handleScannedData(st.id, 'MANUAL')}
+                          className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-emerald-600 text-slate-300 hover:text-white font-bold text-xs transition-colors cursor-pointer"
+                        >
+                          + Tanda Hadir
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* 4. REAL-TIME SCAN RESULT CARD (SUCCESS / DUPLICATE / ERROR) */}
+          {scanResult && (
+            <div
+              id="scanner-latest-result-card"
+              className={`rounded-3xl border p-5 transition-all shadow-2xl animate-fadeIn ${
+                scanResult.success
+                  ? 'bg-emerald-950/50 border-emerald-500/50 text-emerald-100'
+                  : scanResult.isDuplicate
+                  ? 'bg-amber-950/50 border-amber-500/50 text-amber-100'
+                  : 'bg-rose-950/50 border-rose-500/50 text-rose-100'
+              }`}
+            >
+              <div className="flex items-start gap-4">
+                <div
+                  className={`w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 text-xl font-bold shadow-lg ${
+                    scanResult.success
+                      ? 'bg-emerald-500 text-slate-950'
+                      : scanResult.isDuplicate
+                      ? 'bg-amber-500 text-slate-950'
+                      : 'bg-rose-500 text-slate-950'
+                  }`}
+                >
+                  {scanResult.success ? (
+                    <CheckCircle2 className="w-7 h-7 text-slate-950" />
+                  ) : scanResult.isDuplicate ? (
+                    <AlertTriangle className="w-7 h-7 text-slate-950" />
+                  ) : (
+                    <XCircle className="w-7 h-7 text-slate-950" />
+                  )}
+                </div>
+
+                <div className="flex-1 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span
+                      className={`text-xs font-black uppercase px-2.5 py-0.5 rounded-full ${
+                        scanResult.success
+                          ? 'bg-emerald-500/30 text-emerald-300 border border-emerald-500/40'
+                          : scanResult.isDuplicate
+                          ? 'bg-amber-500/30 text-amber-300 border border-amber-500/40'
+                          : 'bg-rose-500/30 text-rose-300 border border-rose-500/40'
+                      }`}
+                    >
+                      {scanResult.success
+                        ? '✓ HADIR'
+                        : scanResult.isDuplicate
+                        ? '⚠️ SUDAH DIREKODKAN'
+                        : '❌ PELAJAR TIDAK DITEMUI'}
+                    </span>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      {new Date(scanResult.timestamp).toLocaleTimeString('ms-MY')}
+                    </span>
+                  </div>
+
+                  <h4 className="text-base font-extrabold text-white">
+                    {scanResult.student ? scanResult.student.name : 'Maklumat Imbasan'}
+                  </h4>
+
+                  {scanResult.student && (
+                    <div className="text-xs text-slate-300 flex flex-wrap items-center gap-x-3 gap-y-1">
+                      <span>No. Pelajar: <strong className="text-white font-mono">{scanResult.student.studentId}</strong></span>
+                      <span>Kelas: <strong className="text-white">{scanResult.student.className}</strong></span>
+                    </div>
+                  )}
+
+                  <p className="text-xs pt-1 font-medium leading-relaxed">
+                    {scanResult.message}
+                  </p>
+
+                  {/* Recovery Action if error */}
+                  {!scanResult.success && !scanResult.isDuplicate && (
+                    <div className="pt-2">
+                      <button
+                        type="button"
+                        onClick={() => setScannerMode('MANUAL')}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs transition-colors cursor-pointer"
+                      >
+                        Gunakan Carian Manual &rarr;
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* RIGHT COLUMN: ATTENDANCE STATUS (HADIR & BELUM HADIR TABS) (5 COLS) */}
+        <div className="lg:col-span-5 space-y-4">
+          <div className="rounded-3xl bg-slate-900 border border-slate-800 p-5 space-y-4 flex flex-col h-full shadow-xl">
+            {/* Header Tabs: Hadir vs Belum Hadir */}
+            <div className="flex items-center gap-1.5 p-1 bg-slate-950 rounded-2xl border border-slate-800">
+              <button
+                type="button"
+                id="tab-attendance-present"
+                onClick={() => setAttendanceListTab('PRESENT')}
+                className={`flex-1 py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  attendanceListTab === 'PRESENT'
+                    ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-900'
+                }`}
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                <span>Hadir ({matchingPresentRecords.length})</span>
+              </button>
+
+              <button
+                type="button"
+                id="tab-attendance-absent"
+                onClick={() => setAttendanceListTab('ABSENT')}
+                className={`flex-1 py-2 px-3 rounded-xl text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  attendanceListTab === 'ABSENT'
+                    ? 'bg-rose-600 text-white shadow-md shadow-rose-600/30'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-900'
+                }`}
+              >
+                <UserX className="w-3.5 h-3.5" />
+                <span>{absentLabel} ({absentStudents.length})</span>
+              </button>
+            </div>
+
+            {/* TAB CONTENT: HADIR (LIVE STREAM) */}
+            {attendanceListTab === 'PRESENT' && (
+              <div className="flex-1 flex flex-col min-h-[360px] space-y-3">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span className="font-semibold">Log Kehadiran Masa Nyata</span>
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      id="btn-backup-scanned-stream-csv"
+                      onClick={handleBackupSessionCSV}
+                      disabled={matchingPresentRecords.length === 0}
+                      className="px-2.5 py-1 rounded-lg bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[11px] font-bold transition-all flex items-center gap-1 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                      title="Simpan fail backup kehadiran ke .CSV"
+                    >
+                      <Download className="w-3 h-3 text-emerald-400" />
+                      <span>Backup .CSV</span>
+                    </button>
+                  </div>
+                </div>
+
+                {filteredSessionRecords.length === 0 ? (
+                  <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-500 border border-dashed border-slate-800 rounded-2xl">
+                    <Users className="w-10 h-10 mb-2 opacity-30 text-slate-400" />
+                    <p className="text-xs font-bold text-slate-400">Belum ada rekod kehadiran bagi sesi ini.</p>
+                    <p className="text-[10px] text-slate-500 mt-1">Imbas kad kod QR pelajar untuk mula merekod kehadiran.</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
+                    {filteredSessionRecords.map((rec) => {
+                      const student = findStudentById(students, rec.studentId) || students.find((s) => s.id === rec.studentId || s.studentId === rec.studentId);
+                      if (!student) return null;
+
+                      return (
+                        <div
+                          key={rec.id}
+                          className="flex items-center justify-between p-3 rounded-2xl bg-slate-950/80 border border-slate-800/80 hover:border-slate-700 transition-all text-xs"
+                        >
+                          <div className="flex items-center gap-3 min-w-0">
+                            <div className={`w-9 h-9 rounded-xl flex items-center justify-center text-xs font-extrabold shrink-0 shadow-sm ${getStudentColor(student.id)}`}>
+                              {getInitials(student.name)}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-bold text-white truncate">{student.name}</div>
+                              <div className="text-[10px] text-slate-400 flex items-center gap-1.5">
+                                <span className="font-mono">{student.studentId}</span>
+                                <span>•</span>
+                                <span className={`px-1.5 py-0.2 rounded border font-semibold ${getClassBadgeColor(student.className)}`}>
+                                  {student.className}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="text-right shrink-0">
+                            <div className="text-[11px] font-mono text-emerald-400 font-bold">
+                              {new Date(rec.timestamp).toLocaleTimeString('ms-MY', {
+                                hour: '2-digit',
+                                minute: '2-digit',
+                                second: '2-digit'
+                              })}
+                            </div>
+                            <div className="text-[9px] text-slate-500 uppercase font-semibold">
+                              {rec.method === 'CAMERA_SCAN' ? 'Kamera' : rec.method === 'MANUAL' ? 'Manual' : 'Imbasan'}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* TAB CONTENT: BELUM HADIR / TIDAK HADIR (ABSENT STUDENTS LIST) */}
+            {attendanceListTab === 'ABSENT' && (
+              <div className="flex-1 flex flex-col min-h-[360px] space-y-3">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span className="font-semibold text-rose-300">
+                    Senarai Pelajar {absentLabel} ({absentStudents.length})
+                  </span>
+                  <div className="flex items-center gap-2">
+                    {absentStudents.length > 0 && (
+                      <button
+                        type="button"
+                        id="btn-copy-live-absent"
+                        onClick={() => {
+                          const text = formatAbsentListText(
+                            currentSession?.className || 'Kelas',
+                            currentSession?.date,
+                            absentStudents,
+                            isSessionClosed
+                          );
+                          if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                            navigator.clipboard.writeText(text);
+                            setCopiedAbsentList(true);
+                            setTimeout(() => setCopiedAbsentList(false), 3000);
+                          }
+                        }}
+                        className="text-[11px] text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer"
+                        title="Salin senarai pelajar belum hadir"
+                      >
+                        <Copy className="w-3 h-3" />
+                        <span>{copiedAbsentList ? '✓ Disalin!' : 'Salin Senarai'}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Search Bar for Absent Students */}
+                {absentStudents.length > 3 && (
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                    <input
+                      type="text"
+                      placeholder="Cari nama atau No. Pelajar..."
+                      value={absentSearchQuery}
+                      onChange={(e) => setAbsentSearchQuery(e.target.value)}
+                      className="w-full pl-8 pr-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-rose-500"
+                    />
+                  </div>
+                )}
+
+                {absentStudents.length === 0 ? (
+                  <div className="flex-1 flex flex-col items-center justify-center p-8 text-center bg-emerald-950/20 border border-dashed border-emerald-500/30 rounded-2xl space-y-2">
+                    <div className="w-12 h-12 rounded-2xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center mx-auto">
+                      <Award className="w-6 h-6" />
+                    </div>
+                    <h4 className="text-sm font-bold text-white">Semua Pelajar Hadir!</h4>
+                    <p className="text-xs text-slate-400 max-w-xs">
+                      Tahniah, kesemua {targetStudents.length} pelajar yang berdaftar telah direkodkan hadir dalam sesi ini.
+                    </p>
+                  </div>
+                ) : filteredAbsentStudents.length === 0 ? (
+                  <div className="flex-1 flex flex-col items-center justify-center p-6 text-center text-slate-500 border border-dashed border-slate-800 rounded-2xl">
+                    <Search className="w-8 h-8 mb-2 opacity-30 text-slate-400" />
+                    <p className="text-xs text-slate-400">Tiada pelajar sepadan dengan carian "{absentSearchQuery}".</p>
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-[460px] overflow-y-auto pr-1">
+                    {filteredAbsentStudents.map((st) => (
+                      <div
+                        key={st.id}
+                        className="flex items-center justify-between p-3 rounded-2xl bg-slate-950/80 border border-slate-800/80 hover:border-slate-700 transition-all text-xs"
+                      >
+                        <div className="flex items-center gap-3 min-w-0">
+                          <div className={`w-9 h-9 rounded-xl flex items-center justify-center text-xs font-extrabold shrink-0 shadow-sm ${getStudentColor(st.id)}`}>
+                            {getInitials(st.name)}
+                          </div>
+                          <div className="min-w-0">
+                            <div className="font-bold text-white truncate">{st.name}</div>
+                            <div className="text-[10px] text-slate-400 flex items-center gap-1.5">
+                              <span className="font-mono text-indigo-300">{st.studentId}</span>
+                              <span>•</span>
+                              <span className={`px-1.5 py-0.2 rounded border font-semibold ${getClassBadgeColor(st.className)}`}>
+                                {st.className}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Quick Actions: WhatsApp Reminder (Secondary) & Manual Check-In with confirmation */}
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {st.phone && (
+                            <a
+                              href={`https://wa.me/${formatWhatsAppPhone(st.phone)}?text=${encodeURIComponent(
+                                `Assalamualaikum / Salam Sejahtera ${st.name}, peringatan kehadiran kelas ${currentSession?.subjectCode || ''} (${currentSession?.className || ''}) bersama ${currentSession?.lecturerName || ''} sedang berlangsung sekarang. Sila hadir ke kelas segera.`
+                              )}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              title="Hantar Peringatan WhatsApp (Sekunder)"
+                              className="p-2 rounded-xl bg-slate-800 hover:bg-emerald-600/20 text-slate-400 hover:text-emerald-300 border border-slate-700 transition-all cursor-pointer"
+                            >
+                              <MessageSquare className="w-3.5 h-3.5" />
+                            </a>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleManualMarkClick(st.id)}
+                            className={`px-3 py-1.5 min-h-[36px] rounded-xl font-bold text-xs border shadow-sm transition-all cursor-pointer active:scale-95 ${
+                              confirmManualStudentId === st.id
+                                ? 'bg-amber-600 hover:bg-emerald-600 text-white border-amber-400 ring-2 ring-amber-400/50 animate-pulse'
+                                : 'bg-slate-800 hover:bg-emerald-600 text-slate-200 hover:text-white border border-slate-700 hover:border-emerald-500'
+                            }`}
+                            title={confirmManualStudentId === st.id ? 'Klik sekali lagi untuk sahkan' : 'Tanda pelajar hadir secara manual'}
+                          >
+                            {confirmManualStudentId === st.id ? 'Pasti Hadir?' : '+ Hadir'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* 5. CLOSE SESSION CONFIRMATION MODAL */}
+      {isCloseModalOpen && currentSession && (
+        <div
+          id="close-session-modal-backdrop"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn"
+        >
+          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-2xl space-y-5 relative">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-2xl bg-rose-500/20 text-rose-400 border border-rose-500/30 flex items-center justify-center">
+                <Lock className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-base font-extrabold text-white">Tutup Sesi Kehadiran?</h3>
+                <p className="text-xs text-slate-400">Sahkan penutupan sesi kelas</p>
+              </div>
+            </div>
+
+            <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 space-y-2 text-xs">
+              <div className="flex justify-between">
+                <span className="text-slate-400">Subjek:</span>
+                <strong className="text-white font-mono">{currentSession.subjectCode || currentSession.sessionName}</strong>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-400">Kelas:</span>
+                <strong className="text-emerald-400">{currentSession.className || 'Semua'}</strong>
+              </div>
+              <div className="flex justify-between pt-1 border-t border-slate-800">
+                <span className="text-slate-400">Jumlah Direkod:</span>
+                <strong className="text-emerald-400 font-mono text-sm">
+                  {matchingPresentRecords.length} / {totalTargetCount > 0 ? totalTargetCount : (targetStudents.length || students.length || 0)} ({percentage}%)
+                </strong>
+              </div>
+            </div>
+
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Semua rekod kehadiran akan disimpan ke dalam pangkalan data secara kekal. Anda masih boleh melihat laporan kehadiran pada bila-bila masa.
+            </p>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setIsCloseModalOpen(false)}
+                className="flex-1 py-3 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold transition-all cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                id="btn-confirm-close-session-action"
+                onClick={handleConfirmCloseSession}
+                className="flex-1 py-3 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-extrabold shadow-lg shadow-rose-900/40 transition-all flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
+              >
+                <Lock className="w-4 h-4" />
+                <span>Tutup Sesi</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 6. POST-SESSION COMPLETION SUMMARY MODAL */}
+      {closedSessionSummary && (
+        <div
+          id="session-summary-modal-backdrop"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md animate-fadeIn"
+        >
+          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-6 shadow-2xl space-y-5 text-center relative overflow-hidden">
+            {/* Header: SESI SELESAI, Class, Subject */}
+            <div className="space-y-1">
+              <span className="inline-block px-3 py-1 rounded-full bg-slate-800 text-emerald-400 border border-slate-700 text-xs font-black uppercase tracking-wider">
+                SESI SELESAI
+              </span>
+              <h3 className="text-xl sm:text-2xl font-black text-white pt-1">
+                {closedSessionSummary.className || 'Kelas'}
+              </h3>
+              <p className="text-xs text-indigo-300 font-semibold">
+                {closedSessionSummary.subjectName || closedSessionSummary.subjectCode}
+              </p>
+            </div>
+
+            {/* Metrics: HADIR & TIDAK HADIR */}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="p-3.5 rounded-2xl bg-emerald-950/30 border border-emerald-500/30 text-left">
+                <div className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider">HADIR</div>
+                <div className="text-xl sm:text-2xl font-black text-white font-mono mt-0.5">
+                  {closedSessionSummary.presentCount}
+                  <span className="text-xs text-slate-400 font-normal"> / {closedSessionSummary.totalCount}</span>
+                </div>
+              </div>
+              <div className={`p-3.5 rounded-2xl text-left border ${
+                closedSessionSummary.absentList && closedSessionSummary.absentList.length > 0
+                  ? 'bg-rose-950/30 border-rose-500/30'
+                  : 'bg-slate-950 border-slate-800'
+              }`}>
+                <div className={`text-[11px] font-bold uppercase tracking-wider ${
+                  closedSessionSummary.absentList && closedSessionSummary.absentList.length > 0
+                    ? 'text-rose-400'
+                    : 'text-slate-400'
+                }`}>
+                  TIDAK HADIR
+                </div>
+                <div className="text-xl sm:text-2xl font-black text-white font-mono mt-0.5">
+                  {closedSessionSummary.absentList ? closedSessionSummary.absentList.length : 0}
+                  <span className="text-xs text-slate-400 font-normal"> orang</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Absent Students List Section */}
+            {closedSessionSummary.absentList && closedSessionSummary.absentList.length > 0 ? (
+              <div className="space-y-2 text-left">
+                <div className="flex items-center justify-between text-xs font-bold text-rose-300 px-1">
+                  <span>TIDAK HADIR ({closedSessionSummary.absentList.length})</span>
+                  <button
+                    type="button"
+                    id="btn-copy-summary-absent"
+                    onClick={() => {
+                      const text = formatAbsentListText(
+                        closedSessionSummary.className || 'Kelas',
+                        closedSessionSummary.date,
+                        closedSessionSummary.absentList,
+                        true
+                      );
+                      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                        navigator.clipboard.writeText(text);
+                        setCopiedAbsentList(true);
+                        setTimeout(() => setCopiedAbsentList(false), 3000);
+                      }
+                    }}
+                    className="text-[11px] text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer"
+                  >
+                    <Copy className="w-3 h-3" />
+                    <span>{copiedAbsentList ? '✓ Disalin!' : 'Salin Senarai'}</span>
+                  </button>
+                </div>
+                <div className="max-h-48 overflow-y-auto space-y-2 pr-0.5">
+                  {closedSessionSummary.absentList.map((s, idx) => (
+                    <div
+                      key={s.id || idx}
+                      className="flex items-start justify-between gap-2 p-2.5 rounded-xl bg-slate-950 border border-slate-800 text-xs"
+                    >
+                      <div className="flex items-start gap-2.5 min-w-0">
+                        <span className="text-rose-400 font-bold shrink-0 mt-0.5">❌</span>
+                        <div className="min-w-0">
+                          <div className="font-bold text-white truncate">{s.name}</div>
+                          <div className="font-mono text-[11px] text-slate-400 mt-0.5">
+                            {s.studentId} • <span className="text-slate-300">{s.className}</span>
+                          </div>
+                        </div>
+                      </div>
+                      {s.phone && (
+                        <a
+                          href={`https://wa.me/${formatWhatsAppPhone(s.phone)}?text=${encodeURIComponent(
+                            `Assalamualaikum / Salam Sejahtera ${s.name}, makluman ketidakhadiran bagi kelas ${closedSessionSummary.subjectCode} (${closedSessionSummary.className}) pada ${formatDisplayDate(closedSessionSummary.date)}.`
+                          )}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title="WhatsApp Pelajar (Sekunder)"
+                          className="p-1.5 rounded-lg bg-slate-800 hover:bg-emerald-600/20 text-slate-400 hover:text-emerald-300 border border-slate-700 transition-colors shrink-0"
+                        >
+                          <MessageSquare className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 text-center space-y-1">
+                <div className="font-extrabold text-sm flex items-center justify-center gap-1.5 text-emerald-400">
+                  <Award className="w-4 h-4" />
+                  <span>SEMUA PELAJAR HADIR ✓</span>
+                </div>
+                <div className="text-xs font-mono text-emerald-300 font-bold">
+                  {closedSessionSummary.totalCount} / {closedSessionSummary.totalCount}
+                </div>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2 pt-1">
+              <button
+                type="button"
+                id="btn-return-workspace"
+                onClick={() => {
+                  setClosedSessionSummary(null);
+                  if (onGoToLecturerWorkspace) onGoToLecturerWorkspace();
+                }}
+                className="w-full py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-lg shadow-indigo-600/30 transition-all cursor-pointer"
+              >
+                Kembali ke Ruang Kerja Pensyarah
+              </button>
+              <button
+                type="button"
+                id="btn-backup-summary-csv"
+                onClick={handleBackupSessionCSV}
+                className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold border border-slate-700 transition-all flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Download className="w-3.5 h-3.5 text-slate-400" />
+                <span>Muat Turun Backup Kehadiran (.CSV)</span>
+              </button>
+              <button
+                type="button"
+                id="btn-view-reports"
+                onClick={() => {
+                  setClosedSessionSummary(null);
+                  if (onGoToReports) onGoToReports();
+                }}
+                className="w-full py-2.5 px-4 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-slate-300 text-xs font-medium transition-all cursor-pointer"
+              >
+                Lihat Rekod & Laporan
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Backup Download Toast Notification */}
+      {backupToast && (
+        <div className="fixed bottom-6 right-6 z-50 bg-emerald-950 border-2 border-emerald-500/60 text-emerald-200 px-5 py-3.5 rounded-2xl shadow-2xl flex items-center gap-3 animate-fadeIn">
+          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          <span className="text-xs font-bold">{backupToast}</span>
+        </div>
+      )}
+
+      {/* MASTER ADMIN SCANNER SETTINGS MODAL */}
+      <ScannerSettingsModal
+        isOpen={isSettingsModalOpen}
+        onClose={() => {
+          setIsSettingsModalOpen(false);
+          setCurrentVolume(soundService.getVolume());
+        }}
+        currentPace={scanPace}
+        onSavePace={(newPace, customValues) => {
+          handlePaceChange(newPace, customValues);
+          setCurrentVolume(soundService.getVolume());
+        }}
+        soundEnabled={soundEnabled}
+        onToggleSound={onToggleSound}
+        isAdmin={isAdmin}
+        onRequestAdminAccess={onRequestAdminAccess}
+      />
+    </div>
+  );
+};

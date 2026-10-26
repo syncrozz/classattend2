@@ -1,0 +1,825 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Lock,
+  ShieldAlert,
+  ShieldCheck,
+  Check,
+  X,
+  UserCheck,
+  Mail,
+  UserPlus,
+  Info,
+  Shield,
+  QrCode,
+  ArrowRight,
+  Sparkles
+} from 'lucide-react';
+import { soundService } from '../services/soundService';
+import { attendanceEngine } from '../services/attendanceEngine';
+import { accessManager } from '../services/accessManager';
+import { auditLogger } from '../services/auditLogger';
+import { Lecturer, UserRole } from '../types';
+import {
+  LECTURER_EMAIL_DOMAIN,
+  LEGACY_LECTURER_EMAIL_DOMAIN,
+  LEGACY_LECTURER_EMAIL_DOMAIN_ALT,
+  DEFAULT_LECTURER_PIN,
+  convertLegacyLecturerEmail,
+  isLegacyLecturerEmail
+} from '../utils/staffUtils';
+
+
+interface LecturerAuthModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSuccess: (lecturer?: Lecturer, role?: 'ADMIN' | 'LECTURER') => void;
+  actionTitle?: string;
+  onOpenSelfRegistration?: () => void;
+  initialTab?: 'LOGIN' | 'ADMIN_PIN' | 'REGISTER';
+}
+
+const SAVED_EMAIL_KEY = 'classattend_saved_lecturer_email';
+
+export const LecturerAuthModal: React.FC<LecturerAuthModalProps> = ({
+  isOpen,
+  onClose,
+  onSuccess,
+  actionTitle = 'Pengesahan Identiti',
+  onOpenSelfRegistration,
+  initialTab = 'LOGIN'
+}) => {
+  const [activeTab, setActiveTab] = useState<'LOGIN' | 'ADMIN_PIN' | 'REGISTER'>('LOGIN');
+  const [email, setEmail] = useState('');
+  const [pin, setPin] = useState('');
+  const [adminPin, setAdminPin] = useState('');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [shake, setShake] = useState(false);
+
+  // New Lecturer Registration form state
+  const [regName, setRegName] = useState('');
+  const [regEmail, setRegEmail] = useState('');
+  const [regIC, setRegIC] = useState('');
+  const [regDepartment, setRegDepartment] = useState('Perakaunan');
+  const [regRole, setRegRole] = useState<'ADMIN' | 'LECTURER'>('LECTURER');
+  const [regSuccessMsg, setRegSuccessMsg] = useState<string | null>(null);
+
+  // Input refs for automatic auto-focusing
+  const adminPinInputRef = useRef<HTMLInputElement>(null);
+  const lecturerPinInputRef = useRef<HTMLInputElement>(null);
+  const emailInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      setActiveTab(initialTab);
+      // 1. Retrieve saved email from last login for this device
+      const savedEmail = localStorage.getItem(SAVED_EMAIL_KEY);
+      const active = attendanceEngine.getActiveLecturer();
+      let initialEmail = active?.email || savedEmail || '';
+
+      // Auto-migrate any legacy saved email to official @mara.gov.my
+      if (initialEmail && isLegacyLecturerEmail(initialEmail)) {
+        initialEmail = convertLegacyLecturerEmail(initialEmail);
+        try {
+          localStorage.setItem(SAVED_EMAIL_KEY, initialEmail);
+        } catch {}
+      }
+
+      setEmail(initialEmail);
+      setPin('');
+      setAdminPin('');
+      setErrorMessage(null);
+      setShake(false);
+      setRegSuccessMsg(null);
+
+      // 2. Auto-focus the input field immediately
+      const timer = setTimeout(() => {
+        if (initialTab === 'ADMIN_PIN') {
+          adminPinInputRef.current?.focus();
+        } else if (initialTab === 'LOGIN') {
+          // If email is already saved/filled, jump directly to PIN input for ultra-fast typing
+          if (initialEmail.trim() !== '') {
+            lecturerPinInputRef.current?.focus();
+          } else {
+            emailInputRef.current?.focus();
+          }
+        }
+      }, 70);
+
+      return () => clearTimeout(timer);
+    }
+  }, [isOpen, initialTab]);
+
+  if (!isOpen) return null;
+
+  const handleEmailChange = (newEmail: string) => {
+    let formatted = newEmail;
+    // Auto-convert any legacy @bpenawar domain if pasted or typed
+    if (isLegacyLecturerEmail(formatted)) {
+      formatted = convertLegacyLecturerEmail(formatted);
+    } else if (newEmail.endsWith('@') && !email.endsWith('@') && !email.includes('@')) {
+      // Auto-complete @mara.gov.my when user types @
+      formatted = `${newEmail}${LECTURER_EMAIL_DOMAIN.replace('@', '')}`;
+    }
+    setEmail(formatted);
+    setErrorMessage(null);
+    if (formatted.trim()) {
+      localStorage.setItem(SAVED_EMAIL_KEY, formatted.trim());
+    }
+  };
+
+  const handleRegEmailChange = (newEmail: string) => {
+    let formatted = newEmail;
+    if (newEmail.endsWith('@') && !regEmail.endsWith('@') && !regEmail.includes('@')) {
+      formatted = `${newEmail}${LECTURER_EMAIL_DOMAIN.replace('@', '')}`;
+    }
+    setRegEmail(formatted);
+  };
+
+  const applyDomainSuggestion = (prefix: string, isReg = false) => {
+    const username = prefix.split('@')[0].trim();
+    if (!username) return;
+    const complete = `${username}${LECTURER_EMAIL_DOMAIN}`;
+    if (isReg) {
+      setRegEmail(complete);
+    } else {
+      setEmail(complete);
+      localStorage.setItem(SAVED_EMAIL_KEY, complete);
+      lecturerPinInputRef.current?.focus();
+    }
+  };
+
+  const handleVerify = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+
+    if (activeTab === 'ADMIN_PIN') {
+      if (adminPin.length !== 4) {
+        setErrorMessage('Sila masukkan 4-digit PIN keselamatan pentadbir.');
+        adminPinInputRef.current?.focus();
+        return;
+      }
+      const res = attendanceEngine.verifyAdminPin(adminPin);
+      if (res.success && res.lecturer) {
+        // Create trusted admin session
+        accessManager.createTrustedSession(res.lecturer, 'ADMIN');
+        setErrorMessage(null);
+        auditLogger.log({
+          category: 'SECURITY_AUTH',
+          action: 'Log Masuk Pentadbir (PIN Master)',
+          details: `Akses mod Pentadbir Utama berjaya disahkan melalui 4-digit PIN keselamatan.`,
+          performedBy: res.lecturer.name || 'Master Admin',
+          target: 'Admin Control Center',
+          severity: 'SUCCESS'
+        });
+        onSuccess(res.lecturer, 'ADMIN');
+        onClose();
+      } else {
+
+        setErrorMessage(res.message);
+        setShake(true);
+        setAdminPin('');
+        setTimeout(() => {
+          setShake(false);
+          adminPinInputRef.current?.focus();
+        }, 400);
+      }
+      return;
+    }
+
+    // Lecturer verification tab
+    const cleanEmail = email.trim().toLowerCase();
+    if (!cleanEmail) {
+      setErrorMessage('Sila masukkan emel pensyarah anda.');
+      emailInputRef.current?.focus();
+      return;
+    }
+
+    if (pin.length !== 4) {
+      setErrorMessage('Sila masukkan 4-digit PIN keselamatan kata laluan.');
+      lecturerPinInputRef.current?.focus();
+      return;
+    }
+
+    const result = attendanceEngine.verifyLecturer(cleanEmail, pin);
+    if (result.success && result.lecturer) {
+      // Save last login email to device localStorage
+      localStorage.setItem(SAVED_EMAIL_KEY, cleanEmail);
+      // Create trusted session
+      const assignedRole = result.lecturer.role === 'ADMIN' ? 'ADMIN' : 'LECTURER';
+      accessManager.createTrustedSession(result.lecturer, assignedRole);
+      setErrorMessage(null);
+      auditLogger.log({
+        category: 'SECURITY_AUTH',
+        action: 'Log Masuk Pensyarah Berjaya',
+        details: `Pensyarah ${result.lecturer.name} (${result.lecturer.email}) berjaya log masuk dengan peranan ${assignedRole}.`,
+        performedBy: result.lecturer.name,
+        target: result.lecturer.email,
+        severity: 'SUCCESS'
+      });
+      onSuccess(result.lecturer, assignedRole);
+      onClose();
+
+    } else {
+      setErrorMessage(result.message);
+      setShake(true);
+      setPin('');
+      setTimeout(() => {
+        setShake(false);
+        lecturerPinInputRef.current?.focus();
+      }, 400);
+    }
+  };
+
+  const handleAdminPinChange = (val: string) => {
+    const numeric = val.replace(/[^0-9]/g, '').slice(0, 4);
+    setAdminPin(numeric);
+    setErrorMessage(null);
+
+    // If 4 digits entered, automatically verify
+    if (numeric.length === 4) {
+      const res = attendanceEngine.verifyAdminPin(numeric);
+      if (res.success && res.lecturer) {
+        accessManager.createTrustedSession(res.lecturer, 'ADMIN');
+        setErrorMessage(null);
+        auditLogger.log({
+          category: 'SECURITY_AUTH',
+          action: 'Log Masuk Pentadbir (PIN Master)',
+          details: `Akses mod Pentadbir Utama disahkan dengan 4-digit PIN keselamatan.`,
+          performedBy: res.lecturer.name || 'Master Admin',
+          target: 'Admin Control Center',
+          severity: 'SUCCESS'
+        });
+        onSuccess(res.lecturer, 'ADMIN');
+        onClose();
+      } else {
+
+        setErrorMessage(res.message);
+        setShake(true);
+        setTimeout(() => {
+          setShake(false);
+          setAdminPin('');
+          adminPinInputRef.current?.focus();
+        }, 400);
+      }
+    }
+  };
+
+  const handleLecturerPinChange = (val: string) => {
+    const numeric = val.replace(/[^0-9]/g, '').slice(0, 4);
+    setPin(numeric);
+    setErrorMessage(null);
+
+    // If 4 digits entered and email exists, automatically verify
+    const cleanEmail = email.trim().toLowerCase();
+    if (numeric.length === 4 && cleanEmail) {
+      const res = attendanceEngine.verifyLecturer(cleanEmail, numeric);
+      if (res.success && res.lecturer) {
+        // Save last login email to device localStorage
+        localStorage.setItem(SAVED_EMAIL_KEY, cleanEmail);
+        const assignedRole = res.lecturer.role === 'ADMIN' ? 'ADMIN' : 'LECTURER';
+        accessManager.createTrustedSession(res.lecturer, assignedRole);
+        setErrorMessage(null);
+        onSuccess(res.lecturer, assignedRole);
+        onClose();
+      } else {
+        setErrorMessage(res.message);
+        setShake(true);
+        setTimeout(() => {
+          setShake(false);
+          setPin('');
+          lecturerPinInputRef.current?.focus();
+        }, 400);
+      }
+    }
+  };
+
+  const handleRegisterLecturer = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!regName || !regEmail) {
+      setErrorMessage('Sila lengkapkan nama dan emel pendaftaran pensyarah.');
+      return;
+    }
+
+    const cleanEmail = regEmail.trim().toLowerCase();
+    if (!cleanEmail.endsWith(LECTURER_EMAIL_DOMAIN)) {
+      setErrorMessage(`Sila gunakan emel rasmi ${LECTURER_EMAIL_DOMAIN}`);
+      return;
+    }
+
+    const newLec: Lecturer = {
+      id: `LEC-${Date.now()}`,
+      name: regName.trim().toUpperCase(),
+      email: cleanEmail,
+      icNumber: regIC.trim() || undefined,
+      pin: DEFAULT_LECTURER_PIN,
+      mustChangePin: true,
+      department: regDepartment,
+      role: regRole,
+      status: 'PENDING',
+      assignedClasses: ['DIA_4A', 'DIA_4B'],
+      assignedSubjects: ['FAR210']
+    };
+
+    const res = attendanceEngine.registerLecturer(newLec);
+    if (res.success) {
+      soundService.playSuccess();
+      setRegSuccessMsg(res.message);
+      setEmail(cleanEmail);
+      localStorage.setItem(SAVED_EMAIL_KEY, cleanEmail);
+      setPin(DEFAULT_LECTURER_PIN);
+      setTimeout(() => {
+        setActiveTab('LOGIN');
+        setRegSuccessMsg(null);
+      }, 1500);
+    } else {
+      setErrorMessage(res.message);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto animate-fadeIn">
+      <div
+        id="access-gateway-modal"
+        className={`bg-slate-900 border ${
+          errorMessage ? 'border-rose-500/80 shadow-rose-950/50' : 'border-indigo-500/40 shadow-indigo-950/50'
+        } rounded-3xl max-w-md w-full p-6 shadow-2xl space-y-4 text-white transition-all my-8 ${
+          shake ? 'animate-bounce' : ''
+        }`}
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div className="flex items-center space-x-2.5">
+            <div className="p-2 bg-indigo-500/20 text-indigo-400 border border-indigo-500/30 rounded-xl">
+              <Lock className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="font-bold text-sm text-white">{actionTitle}</h3>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1 text-slate-400 hover:text-white rounded-lg transition-colors cursor-pointer"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Tab Switcher: [Pensyarah] (Default) | [PIN Admin] | [Daftar] */}
+        <div className="grid grid-cols-3 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs gap-1">
+          <button
+            type="button"
+            id="tab-access-pensyarah"
+            onClick={() => {
+              setActiveTab('LOGIN');
+              setErrorMessage(null);
+            }}
+            className={`py-2 rounded-lg font-semibold transition-all cursor-pointer flex items-center justify-center gap-1 text-[11px] ${
+              activeTab === 'LOGIN' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <UserCheck className="w-3.5 h-3.5" />
+            <span>Pensyarah</span>
+          </button>
+
+          <button
+            type="button"
+            id="tab-access-admin-pin"
+            onClick={() => {
+              setActiveTab('ADMIN_PIN');
+              setErrorMessage(null);
+            }}
+            className={`py-2 rounded-lg font-semibold transition-all cursor-pointer flex items-center justify-center gap-1 text-[11px] ${
+              activeTab === 'ADMIN_PIN' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Shield className="w-3.5 h-3.5" />
+            <span>PIN Admin</span>
+          </button>
+
+          <button
+            type="button"
+            id="tab-access-daftar"
+            onClick={() => {
+              setActiveTab('REGISTER');
+              setErrorMessage(null);
+            }}
+            className={`py-2 rounded-lg font-semibold transition-all cursor-pointer flex items-center justify-center gap-1 text-[11px] ${
+              activeTab === 'REGISTER' ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <UserPlus className="w-3.5 h-3.5" />
+            <span>Daftar</span>
+          </button>
+        </div>
+
+        {/* TAB 1: PENSYARAH LOGIN (Default Tab) */}
+        {activeTab === 'LOGIN' && (
+          <form onSubmit={handleVerify} className="space-y-4">
+            {/* Email Input with Last Login Memory */}
+            <div className="space-y-1">
+              <label className="text-[11px] font-medium text-slate-300 flex items-center justify-between">
+                <span>Emel Rasmi Pensyarah</span>
+                <span className="text-[10px] text-indigo-400 font-mono font-bold tracking-wide">@mara.gov.my</span>
+              </label>
+              <div className="relative">
+                <Mail className="w-4 h-4 text-slate-400 absolute left-3 top-3" />
+                <input
+                  ref={emailInputRef}
+                  type="email"
+                  value={email}
+                  onChange={(e) => handleEmailChange(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      lecturerPinInputRef.current?.focus();
+                    }
+                  }}
+                  placeholder="nama@mara.gov.my"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-9 pr-3 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-mono"
+                />
+              </div>
+
+              {/* Instant Domain Auto-Suggestion Pill */}
+              {email.trim() && !email.toLowerCase().includes(LECTURER_EMAIL_DOMAIN) && (
+                <div className="pt-0.5">
+                  <button
+                    type="button"
+                    onClick={() => applyDomainSuggestion(email, false)}
+                    className="w-full text-left inline-flex items-center justify-between gap-1 text-[11px] font-medium text-indigo-300 bg-indigo-950/70 border border-indigo-500/40 hover:bg-indigo-900/90 hover:border-indigo-400 px-2.5 py-1.5 rounded-xl transition-all cursor-pointer shadow-sm"
+                  >
+                    <div className="flex items-center gap-1 truncate font-mono text-[11px]">
+                      <span className="text-slate-400">Cadangan:</span>
+                      <span className="font-bold text-indigo-200 truncate">
+                        {email.split('@')[0]}@mara.gov.my
+                      </span>
+                    </div>
+                    <span className="text-[10px] bg-indigo-500/40 text-indigo-200 px-1.5 py-0.5 rounded font-semibold shrink-0">
+                      Gunakan ↵
+                    </span>
+                  </button>
+                </div>
+              )}
+
+              {email && email.toLowerCase().includes(LECTURER_EMAIL_DOMAIN) && (
+                <div className="flex justify-between items-center text-[10px] text-slate-400 px-1 pt-0.5">
+                  <span className="text-emerald-400 flex items-center gap-1">
+                    <Check className="w-3 h-3 text-emerald-400" />
+                    <span>Domain sah @mara.gov.my</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setEmail('');
+                      localStorage.removeItem(SAVED_EMAIL_KEY);
+                      emailInputRef.current?.focus();
+                    }}
+                    className="text-slate-400 hover:text-rose-300 underline cursor-pointer"
+                  >
+                    Tukar emel
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Ready-to-type 4-Digit PIN Element */}
+            <div className="space-y-2">
+              <label className="text-[11px] font-bold text-slate-300 block text-center uppercase tracking-wider">
+                PIN Keselamatan
+              </label>
+
+              <div
+                onClick={() => lecturerPinInputRef.current?.focus()}
+                className="relative flex justify-center items-center space-x-3 my-2 cursor-text"
+              >
+                <input
+                  ref={lecturerPinInputRef}
+                  type="password"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={4}
+                  value={pin}
+                  onChange={(e) => handleLecturerPinChange(e.target.value)}
+                  autoFocus={Boolean(email)}
+                  autoComplete="one-time-code"
+                  className="absolute inset-0 opacity-0 w-full h-full cursor-text"
+                  aria-label="4 Digit PIN Pensyarah"
+                />
+
+                {[0, 1, 2, 3].map((index) => {
+                  const hasDigit = pin.length > index;
+                  const isCurrent = pin.length === index;
+                  return (
+                    <div
+                      key={index}
+                      className={`w-14 h-14 rounded-2xl border-2 flex items-center justify-center font-mono font-bold text-2xl transition-all ${
+                        hasDigit
+                          ? 'border-indigo-500 bg-indigo-950/90 text-indigo-300 shadow-lg shadow-indigo-500/20 scale-105'
+                          : isCurrent
+                          ? 'border-indigo-400/80 bg-slate-800 ring-2 ring-indigo-500/40 animate-pulse text-indigo-400'
+                          : 'border-slate-700 bg-slate-800/50 text-slate-600'
+                      }`}
+                    >
+                      {hasDigit ? '•' : ''}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {errorMessage && (
+                <div className="text-rose-400 text-xs font-medium flex items-start space-x-2 bg-rose-950/60 border border-rose-500/30 p-2.5 rounded-xl">
+                  <ShieldAlert className="w-4 h-4 shrink-0 text-rose-400 mt-0.5" />
+                  <span className="text-left text-[11px] leading-relaxed">{errorMessage}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Form Actions */}
+            <div className="pt-2 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setPin('');
+                  setErrorMessage(null);
+                  lecturerPinInputRef.current?.focus();
+                }}
+                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold py-2.5 rounded-xl border border-slate-700 cursor-pointer"
+              >
+                Padam
+              </button>
+              <button
+                type="submit"
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs py-2.5 rounded-xl transition-all shadow-md shadow-indigo-600/30 cursor-pointer flex items-center justify-center space-x-1.5"
+              >
+                <Check className="w-4 h-4" />
+                <span>Masuk Workspace</span>
+              </button>
+            </div>
+
+            {/* In-Modal Emergency Cache Purge Button */}
+            <div className="pt-2 text-center border-t border-slate-800/80">
+              <button
+                type="button"
+                onClick={() => {
+                  try {
+                    if ('caches' in window) {
+                      caches.keys().then((names) => names.forEach((n) => caches.delete(n)));
+                    }
+                    if ('serviceWorker' in navigator) {
+                      navigator.serviceWorker.getRegistrations().then((regs) => regs.forEach((r) => r.unregister()));
+                    }
+                    localStorage.removeItem('classattend_saved_lecturer_email');
+                    localStorage.removeItem('syncrozz_trusted_access_v1');
+                    localStorage.removeItem('classattend_active_lecturer_v5');
+                  } catch (e) {}
+                  window.location.replace(window.location.pathname + '?reset=' + Date.now() + window.location.hash);
+                }}
+                className="text-[10px] text-slate-400 hover:text-indigo-300 underline transition-colors cursor-pointer inline-flex items-center gap-1"
+                title="Padam cache peranti dan muat semula versi rasmi terkini"
+              >
+                <span>Masih nampak domain lama? Klik untuk Segar Semula Cache</span>
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* TAB 2: ADMIN PIN */}
+        {activeTab === 'ADMIN_PIN' && (
+          <form onSubmit={handleVerify} className="space-y-4">
+            <div className="p-3 bg-slate-800/80 rounded-2xl border border-slate-700/60 text-xs space-y-1.5 text-center">
+              <div className="flex items-center justify-center gap-1.5 text-indigo-300 font-semibold">
+                <ShieldCheck className="w-4 h-4 text-emerald-400" />
+                <span>Pengesahan Akses Pentadbir Sistem (Admin)</span>
+              </div>
+              <p className="text-slate-300 text-[11px]">
+                Taip 4-digit PIN keselamatan pentadbir untuk membuka Admin Control Center & kelulusan pensyarah.
+              </p>
+            </div>
+
+            {/* Ready-to-type 4-Digit Input Element */}
+            <div className="space-y-2">
+              <label className="text-[11px] font-bold text-slate-300 block text-center uppercase tracking-wider">
+                Masukkan 4-Digit PIN Pentadbir
+              </label>
+
+              {/* Interactive Click-to-focus 4-box display */}
+              <div
+                onClick={() => adminPinInputRef.current?.focus()}
+                className="relative flex justify-center items-center space-x-3 my-3 cursor-text"
+              >
+                <input
+                  ref={adminPinInputRef}
+                  type="password"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  maxLength={4}
+                  value={adminPin}
+                  onChange={(e) => handleAdminPinChange(e.target.value)}
+                  autoFocus
+                  autoComplete="one-time-code"
+                  className="absolute inset-0 opacity-0 w-full h-full cursor-text"
+                  aria-label="4 Digit PIN Pentadbir"
+                />
+
+                {[0, 1, 2, 3].map((index) => {
+                  const hasDigit = adminPin.length > index;
+                  const isCurrent = adminPin.length === index;
+                  return (
+                    <div
+                      key={index}
+                      className={`w-14 h-14 rounded-2xl border-2 flex items-center justify-center font-mono font-bold text-2xl transition-all ${
+                        hasDigit
+                          ? 'border-indigo-500 bg-indigo-950/90 text-indigo-300 shadow-lg shadow-indigo-500/20 scale-105'
+                          : isCurrent
+                          ? 'border-indigo-400/80 bg-slate-800 ring-2 ring-indigo-500/40 animate-pulse text-indigo-400'
+                          : 'border-slate-700 bg-slate-800/50 text-slate-600'
+                      }`}
+                    >
+                      {hasDigit ? '•' : ''}
+                    </div>
+                  );
+                })}
+              </div>
+
+              <p className="text-[11px] text-center text-slate-400">
+                Ruang input sedia untuk ditaip terus menggunakan papan kekunci anda.
+              </p>
+
+              {errorMessage && (
+                <div className="text-rose-400 text-xs font-medium flex items-center justify-center space-x-1.5 bg-rose-950/60 border border-rose-500/30 p-2.5 rounded-xl">
+                  <ShieldAlert className="w-4 h-4 shrink-0 text-rose-400" />
+                  <span className="text-left text-[11px]">{errorMessage}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Form Actions */}
+            <div className="pt-2 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setAdminPin('');
+                  setErrorMessage(null);
+                  adminPinInputRef.current?.focus();
+                }}
+                className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold py-2.5 rounded-xl border border-slate-700 cursor-pointer"
+              >
+                Padam
+              </button>
+              <button
+                type="submit"
+                className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs py-2.5 rounded-xl transition-all shadow-md shadow-indigo-600/30 cursor-pointer flex items-center justify-center space-x-1.5"
+              >
+                <Check className="w-4 h-4" />
+                <span>Sahkan PIN Admin</span>
+              </button>
+            </div>
+          </form>
+        )}
+
+        {/* TAB 3: REGISTER NEW LECTURER */}
+        {activeTab === 'REGISTER' && (
+          <div className="space-y-4">
+            {/* Multi-subject registration banner */}
+            <div className="p-4 rounded-2xl bg-gradient-to-r from-indigo-950/60 via-slate-900 to-indigo-950/60 border border-indigo-500/40 text-center space-y-2">
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 text-[10px] font-bold uppercase">
+                <Sparkles className="w-3 h-3" />
+                <span>Pendaftaran Lengkap Pensyarah</span>
+              </div>
+              <h4 className="text-xs sm:text-sm font-bold text-white">
+                Daftar Profil & Pilih Pelbagai Subjek / Kelas
+              </h4>
+              <p className="text-[11px] text-slate-300 leading-relaxed">
+                Pendaftaran kendiri dengan penetapan subjek dan kelas yang diajar secara terperinci.
+              </p>
+              {onOpenSelfRegistration && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenSelfRegistration();
+                  }}
+                  className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold shadow-md shadow-indigo-600/30 transition-all flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  <span>Buka Borang Pendaftaran Penuh</span>
+                  <ArrowRight className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            {/* Or quick form below */}
+            <form onSubmit={handleRegisterLecturer} className="space-y-3 pt-2 border-t border-slate-800">
+              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">
+                Atau Pendaftaran Pantas:
+              </div>
+
+              {regSuccessMsg && (
+                <div className="p-3 bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-xs rounded-xl flex items-center gap-2">
+                  <Check className="w-4 h-4 shrink-0" />
+                  <span>{regSuccessMsg}</span>
+                </div>
+              )}
+
+              <div className="space-y-1">
+                <label className="text-[11px] font-medium text-slate-300">Nama Penuh Pensyarah</label>
+                <input
+                  type="text"
+                  value={regName}
+                  onChange={(e) => setRegName(e.target.value)}
+                  placeholder="cth: AHMAD KHAIRI BIN MOHD"
+                  required
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 uppercase"
+                />
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[11px] font-medium text-slate-300 flex items-center justify-between">
+                  <span>Emel Rasmi Pensyarah</span>
+                  <span className="text-[10px] text-indigo-400 font-mono">{LECTURER_EMAIL_DOMAIN}</span>
+                </label>
+                <input
+                  type="email"
+                  value={regEmail}
+                  onChange={(e) => handleRegEmailChange(e.target.value)}
+                  placeholder={`nama${LECTURER_EMAIL_DOMAIN}`}
+                  required
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-mono"
+                />
+                {regEmail.trim() && !regEmail.toLowerCase().includes(LECTURER_EMAIL_DOMAIN) && (
+                  <button
+                    type="button"
+                    onClick={() => applyDomainSuggestion(regEmail, true)}
+                    className="w-full text-left inline-flex items-center justify-between gap-1 text-[11px] font-medium text-indigo-300 bg-indigo-950/70 border border-indigo-500/40 hover:bg-indigo-900/90 hover:border-indigo-400 px-2.5 py-1 rounded-lg transition-all cursor-pointer shadow-sm mt-1"
+                  >
+                    <span className="truncate font-mono text-[10px]">
+                      Cadangan: {regEmail.split('@')[0]}{LECTURER_EMAIL_DOMAIN}
+                    </span>
+                    <span className="text-[10px] bg-indigo-500/40 text-indigo-200 px-1.5 py-0.2 rounded font-semibold shrink-0">
+                      Gunakan
+                    </span>
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[11px] font-medium text-slate-300">
+                  No. Kad Pengenalan (Pilihan)
+                </label>
+                <input
+                  type="text"
+                  value={regIC}
+                  onChange={(e) => setRegIC(e.target.value)}
+                  placeholder="cth: 861115-46-5305"
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 font-mono"
+                />
+                <p className="text-[10px] text-slate-400 mt-0.5">
+                  Kata laluan lalai akaun baharu ialah 1234. Anda perlu menukar kata laluan pada log masuk pertama.
+                </p>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-[11px] font-medium text-slate-300">Jabatan</label>
+                <select
+                  value={regDepartment}
+                  onChange={(e) => setRegDepartment(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-indigo-500 cursor-pointer"
+                >
+                  <option value="Perakaunan">Perakaunan</option>
+                  <option value="Sains Kuantitatif">Sains Kuantitatif</option>
+                  <option value="Pengurusan Perniagaan">Pengurusan Perniagaan</option>
+                  <option value="Pengajian Am">Pengajian Am</option>
+                </select>
+              </div>
+
+              {errorMessage && (
+                <div className="text-rose-400 text-xs bg-rose-950/60 border border-rose-500/30 p-2 rounded-xl">
+                  {errorMessage}
+                </div>
+              )}
+
+              <div className="pt-2 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setActiveTab('LOGIN')}
+                  className="px-4 py-2 bg-slate-800 text-slate-300 text-xs rounded-xl hover:bg-slate-700 font-semibold cursor-pointer"
+                >
+                  Batal
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer flex items-center gap-1"
+                >
+                  <UserPlus className="w-4 h-4" />
+                  <span>Daftar Pensyarah</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Export alias for backward compatibility
+export const AdminPinModal = LecturerAuthModal;
+

@@ -1,0 +1,4848 @@
+import {
+  Student,
+  AttendanceSession,
+  AttendanceRecord,
+  EventStatus,
+  ScanResult,
+  AttendanceMethod,
+  Lecturer,
+  Subject,
+  Enrollment,
+  TeachingAssignment
+} from '../types';
+import {
+  INITIAL_STUDENTS,
+  INITIAL_LECTURERS,
+  INITIAL_SUBJECTS,
+  INITIAL_TEACHING_ASSIGNMENTS,
+  INITIAL_SESSIONS,
+  INITIAL_ATTENDANCE_RECORDS
+} from '../data/mockData';
+import {
+  sortSessionsLatestFirst,
+  normalizeStudentId,
+  stripStudentId,
+  findStudentById
+} from '../utils/studentUtils';
+import {
+  LECTURER_EMAIL_DOMAIN,
+  LEGACY_LECTURER_EMAIL_DOMAIN,
+  LEGACY_LECTURER_EMAIL_DOMAIN_ALT,
+  DEFAULT_LECTURER_PIN,
+  convertLegacyLecturerEmail,
+  isLegacyLecturerEmail,
+  normalizeLecturerName
+} from '../utils/staffUtils';
+import { KNOWN_KPM_COURSES, deduceDepartmentFromCode, splitClassNames, normalizeClassCode } from '../utils/csvHelper';
+import { areClassesMatching } from '../utils/classHelper';
+import { isLecturerAuthorizedForSession } from '../utils/sessionAuth';
+import { auditLogger } from './auditLogger';
+import {
+  db,
+  sanitizeForFirestore,
+  handleFirestoreError,
+  OperationType,
+  FirestoreErrorCategory,
+  getIsQuotaExceeded,
+  markQuotaExceeded,
+  subscribeQuotaStatus
+} from './firebase';
+import {
+  collection,
+  doc,
+  setDoc,
+  deleteDoc,
+  onSnapshot,
+  writeBatch,
+  getDocs
+} from 'firebase/firestore';
+
+const STORAGE_KEYS = {
+  STUDENTS: 'classattend_students_v5',
+  LECTURERS: 'classattend_lecturers_v5',
+  SUBJECTS: 'classattend_subjects_v5',
+  SESSIONS: 'classattend_sessions_v5',
+  RECORDS: 'classattend_records_v5',
+  ENROLLMENTS: 'classattend_enrollments_v5',
+  TEACHING_ASSIGNMENTS: 'classattend_teaching_assignments_v5',
+  ACTIVE_LECTURER: 'classattend_active_lecturer_v5',
+  INITIALIZED: 'classattend_initialized_v5'
+};
+
+const inMemoryFallbackStorage: Record<string, string> = {};
+
+function safeStorageGet(key: string): string | null {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      return window.localStorage.getItem(key);
+    }
+    if (typeof localStorage !== 'undefined' && localStorage.getItem) {
+      return localStorage.getItem(key);
+    }
+    return inMemoryFallbackStorage[key] || null;
+  } catch {
+    return inMemoryFallbackStorage[key] || null;
+  }
+}
+
+function safeStorageSet(key: string, value: string): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.setItem(key, value);
+    } else if (typeof localStorage !== 'undefined' && localStorage.setItem) {
+      localStorage.setItem(key, value);
+    }
+    inMemoryFallbackStorage[key] = value;
+  } catch {
+    inMemoryFallbackStorage[key] = value;
+  }
+}
+
+function safeStorageRemove(key: string): void {
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      window.localStorage.removeItem(key);
+    } else if (typeof localStorage !== 'undefined' && localStorage.removeItem) {
+      localStorage.removeItem(key);
+    }
+    delete inMemoryFallbackStorage[key];
+  } catch {
+    delete inMemoryFallbackStorage[key];
+  }
+}
+
+const DUMMY_SESSION_IDS: string[] = [];
+const DUMMY_RECORD_PREFIXES: string[] = [];
+const DUMMY_SUBJECT_IDS: string[] = [];
+const DUMMY_LECTURER_IDS: string[] = [];
+
+class AttendanceEngine {
+  private students: Student[] = [];
+  private lecturers: Lecturer[] = [];
+  private subjects: Subject[] = [];
+  private sessions: AttendanceSession[] = [];
+  private attendanceRecords: AttendanceRecord[] = [];
+  private enrollments: Enrollment[] = [];
+  private teachingAssignments: TeachingAssignment[] = [];
+  private activeLecturer: Lecturer | null = null;
+  private enrollmentListeners: Set<(enrollments: Enrollment[]) => void> = new Set();
+  private studentListeners: Set<(students: Student[]) => void> = new Set();
+  private lecturerListeners: Set<(lecturers: Lecturer[]) => void> = new Set();
+  private subjectListeners: Set<(subjects: Subject[]) => void> = new Set();
+  private sessionListeners: Set<(sessions: AttendanceSession[]) => void> = new Set();
+  private recordListeners: Set<(records: AttendanceRecord[]) => void> = new Set();
+  private teachingAssignmentListeners: Set<(assignments: TeachingAssignment[]) => void> = new Set();
+
+  // Singleton shared Firestore listener handles (one active listener per collection)
+  private studentFirestoreUnsub: (() => void) | null = null;
+  private lecturerFirestoreUnsub: (() => void) | null = null;
+  private subjectFirestoreUnsub: (() => void) | null = null;
+  private sessionFirestoreUnsub: (() => void) | null = null;
+  private recordFirestoreUnsub: (() => void) | null = null;
+  private enrollmentFirestoreUnsub: (() => void) | null = null;
+  private teachingAssignmentFirestoreUnsub: (() => void) | null = null;
+
+  // Idempotent remote reconciliation tracking to prevent write-read amplification cascades
+  private reconcilingSessionIds: Set<string> = new Set();
+
+  private broadcastChannel: BroadcastChannel | null = null;
+
+  private isFirestoreConnected: boolean = false;
+
+  constructor() {
+    this.initializeData();
+    this.initCrossTabSync();
+    this.initQuotaListener();
+  }
+
+  private initQuotaListener() {
+    subscribeQuotaStatus((exceeded) => {
+      if (!exceeded) {
+        // Quota recovered: resume active shared subscriptions safely
+        this.resumeActiveSharedListeners();
+      } else {
+        // Quota exceeded: safely detach all open Firestore listeners immediately
+        this.detachAllFirestoreListeners();
+      }
+    });
+  }
+
+  public detachAllFirestoreListeners() {
+    if (this.sessionFirestoreUnsub) { try { this.sessionFirestoreUnsub(); } catch {} this.sessionFirestoreUnsub = null; }
+    if (this.studentFirestoreUnsub) { try { this.studentFirestoreUnsub(); } catch {} this.studentFirestoreUnsub = null; }
+    if (this.lecturerFirestoreUnsub) { try { this.lecturerFirestoreUnsub(); } catch {} this.lecturerFirestoreUnsub = null; }
+    if (this.subjectFirestoreUnsub) { try { this.subjectFirestoreUnsub(); } catch {} this.subjectFirestoreUnsub = null; }
+    if (this.recordFirestoreUnsub) { try { this.recordFirestoreUnsub(); } catch {} this.recordFirestoreUnsub = null; }
+    if (this.enrollmentFirestoreUnsub) { try { this.enrollmentFirestoreUnsub(); } catch {} this.enrollmentFirestoreUnsub = null; }
+    if (this.teachingAssignmentFirestoreUnsub) { try { this.teachingAssignmentFirestoreUnsub(); } catch {} this.teachingAssignmentFirestoreUnsub = null; }
+  }
+
+  public resumeActiveSharedListeners() {
+    if (!db || getIsQuotaExceeded()) return;
+    if (this.sessionListeners.size > 0 && !this.sessionFirestoreUnsub) this.startSharedSessionsListener();
+    if (this.studentListeners.size > 0 && !this.studentFirestoreUnsub) this.startSharedStudentsListener();
+    if (this.lecturerListeners.size > 0 && !this.lecturerFirestoreUnsub) this.startSharedLecturersListener();
+    if (this.subjectListeners.size > 0 && !this.subjectFirestoreUnsub) this.startSharedSubjectsListener();
+    if (this.recordListeners.size > 0 && !this.recordFirestoreUnsub) this.startSharedRecordsListener();
+    if (this.enrollmentListeners.size > 0 && !this.enrollmentFirestoreUnsub) this.startSharedEnrollmentsListener();
+    if (this.teachingAssignmentListeners.size > 0 && !this.teachingAssignmentFirestoreUnsub) this.startSharedTeachingAssignmentsListener();
+  }
+
+  private initCrossTabSync() {
+    if (typeof window !== 'undefined') {
+      if (typeof BroadcastChannel !== 'undefined') {
+        try {
+          this.broadcastChannel = new BroadcastChannel('classattend_cross_tab_sync');
+          this.broadcastChannel.onmessage = (event) => {
+            if (event.data && event.data.type === 'CLASSATTEND_SYNC') {
+              this.reloadFromStorageAndNotify();
+            }
+          };
+        } catch (e) {
+          console.warn('BroadcastChannel sync init notice:', e);
+        }
+      }
+
+      window.addEventListener('storage', (e) => {
+        if (e.key && Object.values(STORAGE_KEYS).includes(e.key as any)) {
+          this.reloadFromStorageAndNotify();
+        }
+      });
+    }
+  }
+
+  private broadcastChange(key?: string) {
+    if (this.broadcastChannel) {
+      try {
+        this.broadcastChannel.postMessage({ type: 'CLASSATTEND_SYNC', key, timestamp: Date.now() });
+      } catch (e) {
+        console.warn('Broadcast channel post message error:', e);
+      }
+    }
+  }
+
+  public reloadFromStorageAndNotify() {
+    try {
+      const storedStudents = safeStorageGet(STORAGE_KEYS.STUDENTS);
+      if (storedStudents) {
+        this.students = JSON.parse(storedStudents);
+        this.notifyStudentListeners();
+      }
+
+      const storedLecturers = safeStorageGet(STORAGE_KEYS.LECTURERS);
+      if (storedLecturers) {
+        this.lecturers = JSON.parse(storedLecturers);
+        this.notifyLecturerListeners();
+      }
+
+      const storedSubjects = safeStorageGet(STORAGE_KEYS.SUBJECTS);
+      if (storedSubjects) {
+        this.subjects = JSON.parse(storedSubjects);
+        this.notifySubjectListeners();
+      }
+
+      const storedSessions = safeStorageGet(STORAGE_KEYS.SESSIONS);
+      if (storedSessions) {
+        this.sessions = JSON.parse(storedSessions);
+        this.notifySessionListeners();
+      }
+
+      const storedRecords = safeStorageGet(STORAGE_KEYS.RECORDS);
+      if (storedRecords) {
+        this.attendanceRecords = JSON.parse(storedRecords);
+        this.notifyRecordListeners();
+      }
+
+      const storedEnrollments = safeStorageGet(STORAGE_KEYS.ENROLLMENTS);
+      if (storedEnrollments) {
+        this.enrollments = JSON.parse(storedEnrollments);
+        this.notifyEnrollmentListeners();
+      }
+
+      const storedAssignments = safeStorageGet(STORAGE_KEYS.TEACHING_ASSIGNMENTS);
+      if (storedAssignments) {
+        this.teachingAssignments = JSON.parse(storedAssignments);
+        this.notifyTeachingAssignmentListeners();
+      }
+    } catch (err) {
+      console.warn('Error during cross-tab reload sync:', err);
+    }
+  }
+
+  private initializeData() {
+    const isInitialized = safeStorageGet(STORAGE_KEYS.INITIALIZED);
+
+    if (isInitialized) {
+      try {
+        const storedStudents = safeStorageGet(STORAGE_KEYS.STUDENTS);
+        const storedLecturers = safeStorageGet(STORAGE_KEYS.LECTURERS);
+        const storedSubjects = safeStorageGet(STORAGE_KEYS.SUBJECTS);
+        const storedSessions = safeStorageGet(STORAGE_KEYS.SESSIONS);
+        const storedRecords = safeStorageGet(STORAGE_KEYS.RECORDS);
+        const storedEnrollments = safeStorageGet(STORAGE_KEYS.ENROLLMENTS);
+        const storedAssignments = safeStorageGet(STORAGE_KEYS.TEACHING_ASSIGNMENTS);
+        const storedActiveLecturer = safeStorageGet(STORAGE_KEYS.ACTIVE_LECTURER);
+
+        if (storedStudents) {
+          const parsed: Student[] = JSON.parse(storedStudents);
+          const dedupedMap = new Map<string, Student>();
+          parsed.forEach((s) => {
+            const rawId = (s.studentId || s.id || '').trim().toUpperCase();
+            if (rawId && !dedupedMap.has(rawId)) {
+              dedupedMap.set(rawId, {
+                ...s,
+                id: rawId,
+                studentId: rawId,
+                name: (s.name || '').trim().toUpperCase(),
+                className: (s.className || 'DIA_4A').trim().toUpperCase().replace(/\s+/g, '_')
+              });
+            }
+          });
+          this.students = Array.from(dedupedMap.values());
+        } else {
+          this.students = [];
+        }
+        if (this.students.length === 0 && INITIAL_STUDENTS.length > 0) {
+          this.students = [...INITIAL_STUDENTS];
+          this.saveStudentsLocally();
+        }
+        this.lecturers = storedLecturers
+          ? JSON.parse(storedLecturers).filter((l: Lecturer) => !DUMMY_LECTURER_IDS.includes(l.id))
+          : [];
+        if (this.lecturers.length === 0 && INITIAL_LECTURERS.length > 0) {
+          this.lecturers = [...INITIAL_LECTURERS];
+          this.saveLecturersLocally();
+        } else {
+          // Always ensure Ahmad Khairi Bin Mohd exists in lecturers with correct email, ADMIN role and PIN
+          const khairiInList = this.lecturers.find(
+            (l) => l.id === 'LEC-KHAIRI' || l.name.toUpperCase().includes('AHMAD KHAIRI') || l.email.toLowerCase().includes('khairi')
+          );
+          if (!khairiInList && INITIAL_LECTURERS.length > 0) {
+            this.lecturers.push(...INITIAL_LECTURERS);
+            this.saveLecturersLocally();
+          } else if (khairiInList) {
+            khairiInList.email = 'khairi.mohd@mara.gov.my';
+            khairiInList.role = 'ADMIN';
+            if (!khairiInList.pin || khairiInList.pin === '1234') {
+              khairiInList.pin = '5313';
+              khairiInList.mustChangePin = false;
+              khairiInList.pinChangedAt = khairiInList.pinChangedAt || '2025-01-10T08:00:00.000Z';
+            }
+            khairiInList.assignedSubjects = [
+              'MPU2162 - PENGAJIAN MALAYSIA 2',
+              'MPU2412 - KURSUS INTEGRITI DAN ANTI RASUAH'
+            ];
+            khairiInList.assignedClasses = ['DIA3A', 'DIA4A'];
+            khairiInList.assignedSections = ['DIA3A', 'DIA4A'];
+            this.saveLecturersLocally();
+          }
+        }
+        this.subjects = storedSubjects ? JSON.parse(storedSubjects) : [];
+        if (this.subjects.length === 0 && INITIAL_SUBJECTS.length > 0) {
+          this.subjects = [...INITIAL_SUBJECTS];
+          this.saveSubjectsLocally();
+        } else {
+          // Ensure all 47 standard courses from INITIAL_SUBJECTS are available
+          const existingCodes = new Set(this.subjects.map((s) => s.code.toUpperCase()));
+          const missing = INITIAL_SUBJECTS.filter((s) => !existingCodes.has(s.code.toUpperCase()));
+          if (missing.length > 0) {
+            this.subjects.push(...missing);
+          }
+          // Do not automatically allocate sections to master course list; lecturers decide what they teach
+          const initialCodesSet = new Set(INITIAL_SUBJECTS.map((s) => s.code.toUpperCase()));
+          this.subjects = this.subjects.map((sub) => {
+            if (initialCodesSet.has(sub.code.toUpperCase()) && (sub.sections || []).length > 0) {
+              return { ...sub, sections: [] };
+            }
+            return sub;
+          });
+          this.saveSubjectsLocally();
+        }
+        this.sessions = storedSessions ? JSON.parse(storedSessions) : [];
+        if (this.sessions.length === 0 && INITIAL_SESSIONS.length > 0) {
+          this.sessions = [...INITIAL_SESSIONS];
+          this.saveSessionsLocally();
+        }
+        this.attendanceRecords = storedRecords ? JSON.parse(storedRecords) : [];
+        this.enrollments = storedEnrollments ? JSON.parse(storedEnrollments) : [];
+        this.teachingAssignments = storedAssignments ? JSON.parse(storedAssignments) : [];
+        if (this.teachingAssignments.length === 0 && INITIAL_TEACHING_ASSIGNMENTS.length > 0) {
+          this.teachingAssignments = [...INITIAL_TEACHING_ASSIGNMENTS];
+          this.saveTeachingAssignmentsLocally();
+        }
+
+        // Enforce authoritative subject-class mapping:
+        // MPU2162 is taken ONLY by DIA3A.
+        // MPU2412 is taken ONLY by DIA4A, DIA4B, DIA4C.
+        const invalidMpu2162Ta = this.teachingAssignments.some(
+          (ta) =>
+            ta.subjectCode?.toUpperCase() === 'MPU2162' &&
+            normalizeClassCode(ta.className) !== 'DIA3A'
+        );
+        const invalidMpu2412Ta = this.teachingAssignments.some(
+          (ta) =>
+            ta.subjectCode?.toUpperCase() === 'MPU2412' &&
+            normalizeClassCode(ta.className) === 'DIA3A'
+        );
+        const mpu2412MissingClasses = !['DIA4A', 'DIA4B', 'DIA4C'].every((cls) =>
+          this.teachingAssignments.some(
+            (ta) =>
+              ta.subjectCode?.toUpperCase() === 'MPU2412' &&
+              normalizeClassCode(ta.className) === cls
+          )
+        );
+
+        if (this.teachingAssignments.length === 0 || invalidMpu2162Ta || invalidMpu2412Ta || mpu2412MissingClasses) {
+          // Remove any MPU2162 assignment that is NOT DIA3A, and any MPU2412 assignment that is DIA3A
+          this.teachingAssignments = this.teachingAssignments.filter((ta) => {
+            const code = ta.subjectCode?.toUpperCase();
+            const normCls = normalizeClassCode(ta.className);
+            if (code === 'MPU2162') {
+              return normCls === 'DIA3A';
+            }
+            if (code === 'MPU2412') {
+              return normCls === 'DIA4A' || normCls === 'DIA4B' || normCls === 'DIA4C';
+            }
+            return true;
+          });
+
+          // Ensure MPU2162 has DIA3A assignment for Khairi
+          if (!this.teachingAssignments.some((ta) => ta.subjectCode?.toUpperCase() === 'MPU2162' && normalizeClassCode(ta.className) === 'DIA3A')) {
+            this.teachingAssignments.push({
+              id: 'TA-KHAIRI-MPU2162-DIA3A',
+              lecturerId: 'LEC-KHAIRI',
+              lecturerName: 'AHMAD KHAIRI BIN MOHD',
+              lecturerEmail: 'khairi.mohd@mara.gov.my',
+              subjectId: 'SUB-MPU2162',
+              subjectCode: 'MPU2162',
+              subjectName: 'PENGAJIAN MALAYSIA 2',
+              className: 'DIA3A',
+              status: 'ACTIVE',
+              createdAt: '2025-01-10T08:00:00.000Z'
+            });
+          }
+
+          // Ensure MPU2412 has DIA4A, DIA4B, DIA4C assignments for Khairi
+          ['DIA4A', 'DIA4B', 'DIA4C'].forEach((cls) => {
+            if (!this.teachingAssignments.some((ta) => ta.subjectCode?.toUpperCase() === 'MPU2412' && normalizeClassCode(ta.className) === cls)) {
+              this.teachingAssignments.push({
+                id: `TA-KHAIRI-MPU2412-${cls}`,
+                lecturerId: 'LEC-KHAIRI',
+                lecturerName: 'AHMAD KHAIRI BIN MOHD',
+                lecturerEmail: 'khairi.mohd@mara.gov.my',
+                subjectId: 'SUB-MPU2412',
+                subjectCode: 'MPU2412',
+                subjectName: 'KURSUS INTEGRITI DAN ANTI RASUAH',
+                className: cls,
+                status: 'ACTIVE',
+                createdAt: '2025-01-10T08:00:00.000Z'
+              });
+            }
+          });
+
+          this.saveTeachingAssignmentsLocally();
+
+          // Sync clean sections in subjects catalog
+          const mpu2162 = this.subjects.find((s) => s.code.toUpperCase() === 'MPU2162');
+          if (mpu2162) {
+            mpu2162.sections = ['DIA3A'];
+            this.saveSubject(mpu2162);
+          }
+          const mpu2412 = this.subjects.find((s) => s.code.toUpperCase() === 'MPU2412');
+          if (mpu2412) {
+            mpu2412.sections = ['DIA4A', 'DIA4B', 'DIA4C'];
+            this.saveSubject(mpu2412);
+          }
+        }
+
+        // Auto-heal: Ensure all lecturers with assigned subjects have active teaching assignments & subjects in catalog
+        let stateNeedsLocalSave = false;
+        this.lecturers.forEach((lec) => {
+          if (lec.assignedSubjects && lec.assignedSubjects.length > 0) {
+            const hasTa = this.teachingAssignments.some(
+              (ta) =>
+                ta.lecturerId === lec.id ||
+                (ta.lecturerEmail && ta.lecturerEmail.toLowerCase() === lec.email.toLowerCase())
+            );
+            if (!hasTa) {
+              const assignedClasses = splitClassNames(
+                Array.isArray(lec.assignedClasses || lec.assignedSections)
+                  ? (lec.assignedClasses || lec.assignedSections || []).join(', ')
+                  : String(lec.assignedClasses || lec.assignedSections || '')
+              );
+              lec.assignedSubjects.forEach((subEntry) => {
+                const code = subEntry.includes('-')
+                  ? subEntry.split('-')[0].trim().toUpperCase().replace(/[^A-Z0-9]/g, '')
+                  : subEntry.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+                if (!code) return;
+                const known = KNOWN_KPM_COURSES[code];
+                const subName = subEntry.includes('-')
+                  ? subEntry.split('-')[1].trim().toUpperCase()
+                  : known?.name || `KURSUS ${code}`;
+                const subDept =
+                  known?.department ||
+                  deduceDepartmentFromCode(code) ||
+                  lec.department ||
+                  'Jabatan Pengajian Am';
+
+                let subObj = this.subjects.find((s) => s.code.toUpperCase() === code);
+                const isMpu2162 = code === 'MPU2162';
+                const isMpu2412 = code === 'MPU2412';
+                const dedicatedClasses = isMpu2162 ? ['DIA3A'] : isMpu2412 ? ['DIA4A', 'DIA4B', 'DIA4C'] : assignedClasses;
+
+                if (!subObj) {
+                  subObj = {
+                    id: `SUB-${code}`,
+                    code,
+                    name: subName,
+                    department: subDept,
+                    sections: dedicatedClasses,
+                    lecturerId: lec.id,
+                    lecturerName: lec.name,
+                    lecturerEmail: lec.email,
+                    status: 'ACTIVE'
+                  };
+                  this.subjects.push(subObj);
+                  stateNeedsLocalSave = true;
+                } else {
+                  subObj.lecturerId = lec.id;
+                  subObj.lecturerName = lec.name;
+                  subObj.lecturerEmail = lec.email;
+                  subObj.sections = isMpu2162
+                    ? ['DIA3A']
+                    : isMpu2412
+                    ? ['DIA4A', 'DIA4B', 'DIA4C']
+                    : splitClassNames([...(subObj.sections || []), ...assignedClasses].join(', '));
+                  stateNeedsLocalSave = true;
+                }
+
+                const targetClasses =
+                  isMpu2162
+                    ? ['DIA3A']
+                    : isMpu2412
+                    ? ['DIA4A', 'DIA4B', 'DIA4C']
+                    : assignedClasses.length > 0
+                    ? assignedClasses
+                    : subObj.sections && subObj.sections.length > 0
+                    ? subObj.sections
+                    : ['DIA_4A'];
+
+                targetClasses.forEach((cls) => {
+                  const cleanClass = cls.trim().toUpperCase();
+                  const assignmentId = `TA_${lec.id}_${code}_${cleanClass.replace(/[^A-Z0-9]/g, '')}`;
+                  if (!this.teachingAssignments.some((ta) => ta.id === assignmentId)) {
+                    this.teachingAssignments.push({
+                      id: assignmentId,
+                      lecturerId: lec.id,
+                      lecturerEmail: lec.email,
+                      lecturerName: lec.name,
+                      subjectId: subObj!.id,
+                      subjectCode: code,
+                      subjectName: subName,
+                      className: cleanClass,
+                      status: 'ACTIVE',
+                      createdAt: new Date().toISOString(),
+                      approvedAt: new Date().toISOString(),
+                      approvedBy: 'System Auto-Sync'
+                    });
+                    stateNeedsLocalSave = true;
+                  }
+                });
+              });
+            }
+          }
+        });
+
+        if (stateNeedsLocalSave) {
+          this.saveSubjectsLocally();
+          this.saveTeachingAssignmentsLocally();
+        }
+        const rawTrusted = safeStorageGet('classattend_trusted_access_session');
+        if (rawTrusted) {
+          try {
+            const sess = JSON.parse(rawTrusted);
+            if (sess && sess.expiresAt && Date.now() < sess.expiresAt) {
+              this.activeLecturer = storedActiveLecturer ? JSON.parse(storedActiveLecturer) : null;
+            } else {
+              this.activeLecturer = null;
+            }
+          } catch {
+            this.activeLecturer = null;
+          }
+        } else {
+          this.activeLecturer = null;
+        }
+      } catch (e) {
+        console.warn('Error reading from localStorage, resetting to clean ClassAttend data', e);
+        this.resetToDefaultData();
+      }
+    } else {
+      this.resetToDefaultData();
+    }
+
+    // Clean any legacy dummy data
+    this.cleanLegacyDummyData();
+
+    // One-time automated data migration for MARA official email (@mara.gov.my)
+    this.runOneTimeDataMigration();
+
+    // Reconcile Single Active Session Invariant (1 Pensyarah = Maksimum 1 Sesi Aktif)
+    this.reconcileSingleActiveSessionPerLecturer();
+
+    if (db) {
+      this.isFirestoreConnected = true;
+    }
+  }
+
+  public reconcileSingleActiveSessionPerLecturer(): boolean {
+    const openByLecturer = new Map<string, AttendanceSession[]>();
+    this.sessions.forEach((s) => {
+      if (s.status === 'OPEN') {
+        const key = (s.lecturerId || s.lecturerEmail || '').trim().toLowerCase();
+        if (key) {
+          const list = openByLecturer.get(key) || [];
+          list.push(s);
+          openByLecturer.set(key, list);
+        }
+      }
+    });
+
+    let modified = false;
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    openByLecturer.forEach((openSessions) => {
+      if (openSessions.length > 1) {
+        // Sort by createdAt or date descending (newest first)
+        openSessions.sort((a, b) => {
+          const timeA = new Date(a.createdAt || a.date).getTime() || 0;
+          const timeB = new Date(b.createdAt || b.date).getTime() || 0;
+          return timeB - timeA;
+        });
+
+        // The newest (index 0) remains OPEN; older sessions (index 1+) are safely closed in memory and persisted
+        const toCloseIds = new Set(openSessions.slice(1).map((s) => s.id));
+        this.sessions = this.sessions.map((s) => {
+          if (toCloseIds.has(s.id)) {
+            modified = true;
+            const closedSession: AttendanceSession = {
+              ...s,
+              status: 'CLOSED' as const,
+              endTime: s.endTime && s.endTime.trim().length > 0 ? s.endTime : timeStr,
+              updatedAt: now.toISOString()
+            };
+
+            // Idempotent Firestore sync: only write if not already in flight and quota is available
+            if (db && !getIsQuotaExceeded() && !this.reconcilingSessionIds.has(closedSession.id)) {
+              this.reconcilingSessionIds.add(closedSession.id);
+              setDoc(doc(db, 'sessions', closedSession.id), sanitizeForFirestore(closedSession), { merge: true })
+                .catch((err) => {
+                  handleFirestoreError(err, OperationType.UPDATE, `sessions/${closedSession.id}`);
+                })
+                .finally(() => {
+                  setTimeout(() => {
+                    this.reconcilingSessionIds.delete(closedSession.id);
+                  }, 10000);
+                });
+            }
+            return closedSession;
+          }
+          return s;
+        });
+      }
+    });
+
+    if (modified) {
+      this.saveSessionsLocally();
+      this.notifySessionListeners();
+    }
+    return modified;
+  }
+
+  /**
+   * Idempotently reconciles remote conflicting OPEN sessions in Firestore without write amplification
+   */
+  private reconcileConflictingSessionsRemotely(olderSessionIds: Set<string>) {
+    if (!db || getIsQuotaExceeded() || olderSessionIds.size === 0) return;
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    olderSessionIds.forEach((sessionId) => {
+      if (this.reconcilingSessionIds.has(sessionId)) return;
+      const sess = this.sessions.find((s) => s.id === sessionId);
+      if (!sess) return;
+
+      this.reconcilingSessionIds.add(sessionId);
+      const closedSession: AttendanceSession = {
+        ...sess,
+        status: 'CLOSED',
+        endTime: sess.endTime && sess.endTime.trim().length > 0 ? sess.endTime : timeStr,
+        updatedAt: now.toISOString()
+      };
+
+      setDoc(doc(db!, 'sessions', sessionId), sanitizeForFirestore(closedSession), { merge: true })
+        .catch((err) => {
+          handleFirestoreError(err, OperationType.UPDATE, `sessions/${sessionId}`);
+        })
+        .finally(() => {
+          setTimeout(() => {
+            this.reconcilingSessionIds.delete(sessionId);
+          }, 10000);
+        });
+    });
+  }
+
+  public cleanLegacyDummyData() {
+    // Filter out dummy sessions and records from memory and local storage
+    this.sessions = this.sessions.filter((s) => !DUMMY_SESSION_IDS.includes(s.id));
+    this.attendanceRecords = this.attendanceRecords.filter(
+      (r) => !DUMMY_RECORD_PREFIXES.some((prefix) => r.id.startsWith(prefix)) && !DUMMY_SESSION_IDS.includes(r.sessionId)
+    );
+    this.subjects = this.subjects.filter((sub) => !DUMMY_SUBJECT_IDS.includes(sub.id));
+    this.lecturers = this.lecturers.filter((lec) => !DUMMY_LECTURER_IDS.includes(lec.id));
+
+    this.saveSessionsLocally();
+    this.saveRecordsLocally();
+    this.saveSubjectsLocally();
+    this.saveLecturersLocally();
+    this.saveEnrollmentsLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    // Delete dummy documents from Firestore only once, and never when quota is exceeded
+    if (db && !getIsQuotaExceeded() && safeStorageGet('classattend_cleaned_legacy_dummy_v3') !== 'true') {
+      safeStorageSet('classattend_cleaned_legacy_dummy_v3', 'true');
+      DUMMY_SESSION_IDS.forEach((id) => deleteDoc(doc(db!, 'sessions', id)).catch(() => {}));
+      DUMMY_SUBJECT_IDS.forEach((id) => deleteDoc(doc(db!, 'subjects', id)).catch(() => {}));
+      DUMMY_LECTURER_IDS.forEach((id) => deleteDoc(doc(db!, 'lecturers', id)).catch(() => {}));
+      ['REC-MPU-01', 'REC-MPU-02', 'REC-MPU-03', 'REC-MPU-04', 'REC-MPU-05', 'REC-MPU-06',
+       'REC-ACC-01', 'REC-ACC-02', 'REC-ACC-03', 'REC-ACC-04',
+       'REC-TAX-01', 'REC-TAX-02', 'REC-TAX-03', 'REC-TAX-04'].forEach((id) => {
+        deleteDoc(doc(db!, 'attendance_records', id)).catch(() => {});
+      });
+    }
+  }
+
+  public legacyLecturerWarnings: string[] = [];
+
+  public getLegacyLecturerWarnings(): string[] {
+    return [...this.legacyLecturerWarnings];
+  }
+
+  /**
+   * One-time automated migration function (Bahagian D):
+   * Migrates any @bpenawar.kpm.edu.my lecturer emails to official @mara.gov.my domain.
+   * Runs once and on application load.
+   *
+   * Responsibilities:
+   * 1. Kemas kini emel pensyarah.
+   * 2. Kemas kini lecturerEmail dalam semua TeachingAssignment, Subject, sesi kehadiran, audit log dan activeLecturer dalam localStorage.
+   * 3. Jika emel sesi aktif sudah lapuk, paksa log masuk semula dengan mesej mesra.
+   * 4. Pensyarah tanpa padanan emel MARA kekal dengan emel lama dan papar amaran kepada admin. Jangan padam data mereka.
+   * 5. Jika src/services/firebase.ts menyimpan data pensyarah, tulis migrasi dan pertukaran PIN ke Firestore juga.
+   */
+  public runOneTimeDataMigration(): {
+    migratedLecturersCount: number;
+    unmigratedCount: number;
+    warnings: string[];
+  } {
+    const emailMigrationMap = new Map<string, string>(); // oldEmail -> newEmail
+    this.legacyLecturerWarnings = [];
+    let migratedCount = 0;
+
+    // Check Ahmad Khairi Bin Mohd: ensure email is khairi.mohd@mara.gov.my, role is ADMIN, pin is 5313
+    const khairiLec = this.lecturers.find(
+      (l) => l.id === 'LEC-KHAIRI' || l.name.toUpperCase().includes('AHMAD KHAIRI') || l.email.toLowerCase().includes('khairi')
+    );
+    if (khairiLec) {
+      const oldKhairiEmail = khairiLec.email.toLowerCase().trim();
+      if (oldKhairiEmail !== 'khairi.mohd@mara.gov.my') {
+        emailMigrationMap.set(oldKhairiEmail, 'khairi.mohd@mara.gov.my');
+        khairiLec.email = 'khairi.mohd@mara.gov.my';
+      }
+      khairiLec.role = 'ADMIN';
+      if (!khairiLec.pin || khairiLec.pin === '1234') {
+        khairiLec.pin = '5313';
+        khairiLec.mustChangePin = false;
+        khairiLec.pinChangedAt = khairiLec.pinChangedAt || '2025-01-10T08:00:00.000Z';
+      }
+    }
+    // Always map known Khairi aliases to official khairi.mohd@mara.gov.my
+    emailMigrationMap.set('khairi@mara.gov.my', 'khairi.mohd@mara.gov.my');
+    emailMigrationMap.set('khairi@bpenawar.kpm.edu.my', 'khairi.mohd@mara.gov.my');
+    emailMigrationMap.set('khairi.mohd@bpenawar.kpm.edu.my', 'khairi.mohd@mara.gov.my');
+
+    // Inspect all lecturers for legacy domain @bpenawar.kpm.edu.my or @bpenawar.kpmbp.edu.my
+    this.lecturers = this.lecturers.map((lec) => {
+      const emailLower = (lec.email || '').trim().toLowerCase();
+      if (
+        emailLower.endsWith(LEGACY_LECTURER_EMAIL_DOMAIN) ||
+        emailLower.endsWith(LEGACY_LECTURER_EMAIL_DOMAIN_ALT) ||
+        emailLower.includes('bpenawar')
+      ) {
+        const maraMatch = convertLegacyLecturerEmail(emailLower);
+        if (maraMatch && maraMatch.endsWith(LECTURER_EMAIL_DOMAIN) && maraMatch !== emailLower) {
+          emailMigrationMap.set(emailLower, maraMatch);
+          migratedCount++;
+
+          // Apply PIN migration rules:
+          let pin = lec.pin || DEFAULT_LECTURER_PIN;
+          let mustChangePin = lec.mustChangePin;
+          let pinChangedAt = lec.pinChangedAt;
+
+          if (lec.pinChangedAt) {
+            // Already changed password: keep pin
+            mustChangePin = false;
+          } else {
+            // Old PIN: reset to '1234' and force change
+            pin = DEFAULT_LECTURER_PIN;
+            mustChangePin = true;
+            pinChangedAt = undefined;
+          }
+
+          return {
+            ...lec,
+            email: maraMatch,
+            pin,
+            mustChangePin,
+            pinChangedAt,
+            role: lec.role === 'ADMIN' ? 'ADMIN' : lec.role
+          };
+        } else {
+          // No valid MARA email match: retain old email, log warning, DO NOT DELETE
+          const warning = `Pensyarah ${lec.name} (${lec.email}) belum mempunyai padanan e-mel rasmi @mara.gov.my. Data mereka dikekalkan.`;
+          this.legacyLecturerWarnings.push(warning);
+          return lec;
+        }
+      }
+      return lec;
+    });
+
+    if (emailMigrationMap.size > 0) {
+      // 1. Update Teaching Assignments
+      this.teachingAssignments = this.teachingAssignments.map((ta) => {
+        const taEmail = (ta.lecturerEmail || '').trim().toLowerCase();
+        if (emailMigrationMap.has(taEmail)) {
+          return {
+            ...ta,
+            lecturerEmail: emailMigrationMap.get(taEmail)!
+          };
+        }
+        const matchingLec = this.lecturers.find((l) => l.id === ta.lecturerId);
+        if (matchingLec && matchingLec.email !== ta.lecturerEmail) {
+          return {
+            ...ta,
+            lecturerEmail: matchingLec.email
+          };
+        }
+        return ta;
+      });
+
+      // 2. Update Subjects
+      this.subjects = this.subjects.map((sub) => {
+        const subEmail = (sub.lecturerEmail || '').trim().toLowerCase();
+        if (emailMigrationMap.has(subEmail)) {
+          return {
+            ...sub,
+            lecturerEmail: emailMigrationMap.get(subEmail)!
+          };
+        }
+        const matchingLec = this.lecturers.find((l) => l.id === sub.lecturerId);
+        if (matchingLec && matchingLec.email !== sub.lecturerEmail) {
+          return {
+            ...sub,
+            lecturerEmail: matchingLec.email
+          };
+        }
+        return sub;
+      });
+
+      // 3. Update Attendance Sessions
+      this.sessions = this.sessions.map((sess) => {
+        const sEmail = (sess.lecturerEmail || '').trim().toLowerCase();
+        if (emailMigrationMap.has(sEmail)) {
+          return {
+            ...sess,
+            lecturerEmail: emailMigrationMap.get(sEmail)!
+          };
+        }
+        const matchingLec = this.lecturers.find((l) => l.id === sess.lecturerId);
+        if (matchingLec && matchingLec.email !== sess.lecturerEmail) {
+          return {
+            ...sess,
+            lecturerEmail: matchingLec.email
+          };
+        }
+        return sess;
+      });
+
+      // 4. Update Audit Logs
+      auditLogger.migrateLecturerEmails(emailMigrationMap);
+
+      // 5. Update activeLecturer in localStorage
+      if (this.activeLecturer) {
+        const activeEmail = (this.activeLecturer.email || '').trim().toLowerCase();
+        if (emailMigrationMap.has(activeEmail)) {
+          this.activeLecturer = {
+            ...this.activeLecturer,
+            email: emailMigrationMap.get(activeEmail)!
+          };
+          this.saveActiveLecturerLocally();
+        }
+      }
+
+      // 6. Check if stored active session email was outdated (ended with @bpenawar.kpm.edu.my or @bpenawar.kpmbp.edu.my)
+      const rawTrusted = safeStorageGet('syncrozz_trusted_access_v1');
+      if (rawTrusted) {
+        try {
+          const sess = JSON.parse(rawTrusted);
+          if (
+            sess &&
+            sess.email &&
+            (sess.email.toLowerCase().endsWith(LEGACY_LECTURER_EMAIL_DOMAIN) ||
+              sess.email.toLowerCase().endsWith('@bpenawar.kpmbp.edu.my'))
+          ) {
+            // Outdated session email: Force friendly re-login
+            localStorage.removeItem('syncrozz_trusted_access_v1');
+            localStorage.removeItem(STORAGE_KEYS.ACTIVE_LECTURER);
+            this.activeLecturer = null;
+            safeStorageSet(
+              'classattend_migration_notice',
+              'Sesi log masuk anda telah ditamatkan kerana migrasi e-mel rasmi @mara.gov.my. Sila log masuk semula menggunakan e-mel rasmi MARA anda dengan kata laluan lalai 1234.'
+            );
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      // 6b. Also auto-migrate classattend_saved_lecturer_email in localStorage
+      const savedEmail = safeStorageGet('classattend_saved_lecturer_email');
+      if (savedEmail) {
+        if (
+          savedEmail.toLowerCase().endsWith(LEGACY_LECTURER_EMAIL_DOMAIN) ||
+          savedEmail.toLowerCase().endsWith('@bpenawar.kpmbp.edu.my')
+        ) {
+          const converted = convertLegacyLecturerEmail(savedEmail);
+          safeStorageSet('classattend_saved_lecturer_email', converted);
+        }
+      }
+
+      // 7. Save everything locally
+      this.saveLecturersLocally();
+      this.saveTeachingAssignmentsLocally();
+      this.saveSubjectsLocally();
+      this.saveSessionsLocally();
+
+      // 8. Log migration to audit trail
+      auditLogger.log({
+        category: 'MASTER_DATA',
+        action: 'Migrasi Emel Pensyarah (One-Time)',
+        details: `Berjaya memindahkan ${migratedCount} akaun pensyarah ke domain rasmi @mara.gov.my serta mengemas kini semua tugasan mengajar, subjek, dan sesi.`,
+        performedBy: 'Sistem Autopilot Migrasi',
+        severity: 'INFO'
+      });
+
+      // 9. Sync to Firestore if available
+      if (db) {
+        try {
+          const batch = writeBatch(db);
+          this.lecturers.forEach((l) => {
+            batch.set(doc(db, 'lecturers', l.id), sanitizeForFirestore(l), { merge: true });
+          });
+          this.teachingAssignments.forEach((ta) => {
+            batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+          });
+          this.subjects.forEach((s) => {
+            batch.set(doc(db, 'subjects', s.id), sanitizeForFirestore(s), { merge: true });
+          });
+          this.sessions.forEach((sess) => {
+            batch.set(doc(db, 'sessions', sess.id), sanitizeForFirestore(sess), { merge: true });
+          });
+          batch.commit().catch(console.warn);
+        } catch (err) {
+          console.warn('Firestore migration batch sync warning:', err);
+        }
+      }
+    }
+
+    safeStorageSet('classattend_migration_mara_email_completed', 'true');
+
+    return {
+      migratedLecturersCount: migratedCount,
+      unmigratedCount: this.legacyLecturerWarnings.length,
+      warnings: this.legacyLecturerWarnings
+    };
+  }
+
+  public clearAllDummyData() {
+    this.sessions = [];
+    this.attendanceRecords = [];
+    this.subjects = [];
+    this.lecturers = [];
+    this.enrollments = [];
+    this.teachingAssignments = [];
+    this.saveSessionsLocally();
+    this.saveRecordsLocally();
+    this.saveSubjectsLocally();
+    this.saveLecturersLocally();
+    this.saveEnrollmentsLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        DUMMY_SESSION_IDS.forEach((id) => batch.delete(doc(db!, 'sessions', id)));
+        DUMMY_SUBJECT_IDS.forEach((id) => batch.delete(doc(db!, 'subjects', id)));
+        DUMMY_LECTURER_IDS.forEach((id) => batch.delete(doc(db!, 'lecturers', id)));
+        ['REC-MPU-01', 'REC-MPU-02', 'REC-MPU-03', 'REC-MPU-04', 'REC-MPU-05', 'REC-MPU-06',
+         'REC-ACC-01', 'REC-ACC-02', 'REC-ACC-03', 'REC-ACC-04',
+         'REC-TAX-01', 'REC-TAX-02', 'REC-TAX-03', 'REC-TAX-04'].forEach((id) => {
+          batch.delete(doc(db!, 'attendance_records', id));
+        });
+        batch.commit().catch(console.warn);
+      } catch (err) {
+        console.warn('Clear dummy data notice:', err);
+      }
+    }
+  }
+
+  public resetToDefaultData() {
+    this.students = [...INITIAL_STUDENTS];
+    this.lecturers = [...INITIAL_LECTURERS];
+    this.subjects = [...INITIAL_SUBJECTS];
+    this.sessions = [...INITIAL_SESSIONS];
+    this.attendanceRecords = [];
+    this.enrollments = [];
+    this.teachingAssignments = [...INITIAL_TEACHING_ASSIGNMENTS];
+    this.activeLecturer = null;
+
+    this.saveStudentsLocally();
+    this.saveLecturersLocally();
+    this.saveSubjectsLocally();
+    this.saveSessionsLocally();
+    this.saveRecordsLocally();
+    this.saveEnrollmentsLocally();
+    this.saveTeachingAssignmentsLocally();
+    this.saveActiveLecturerLocally();
+    safeStorageSet(STORAGE_KEYS.INITIALIZED, 'true');
+  }
+
+  public async syncInitialStudentsToFirestore() {
+    if (!db || this.students.length === 0) return;
+    try {
+      const batch = writeBatch(db);
+      for (const student of this.students) {
+        batch.set(doc(db, 'students', student.id), sanitizeForFirestore(student), { merge: true });
+      }
+      await batch.commit();
+    } catch (e: any) {
+      console.warn('Firestore initial students seed notice:', e?.message || e);
+    }
+  }
+
+  public async syncInitialLecturersToFirestore() {
+    if (!db || this.lecturers.length === 0) return;
+    try {
+      const batch = writeBatch(db);
+      for (const lecturer of this.lecturers) {
+        batch.set(doc(db, 'lecturers', lecturer.id), sanitizeForFirestore(lecturer), { merge: true });
+      }
+      await batch.commit();
+    } catch (e: any) {
+      console.warn('Firestore initial lecturers seed notice:', e?.message || e);
+    }
+  }
+
+  public async syncInitialTeachingAssignmentsToFirestore() {
+    if (!db || this.teachingAssignments.length === 0) return;
+    try {
+      const batch = writeBatch(db);
+      for (const ta of this.teachingAssignments) {
+        batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+      }
+      await batch.commit();
+    } catch (e: any) {
+      console.warn('Firestore initial teaching assignments seed notice:', e?.message || e);
+    }
+  }
+
+  public async syncInitialSessionsToFirestore() {
+    if (!db || this.sessions.length === 0) return;
+    try {
+      const batch = writeBatch(db);
+      for (const session of this.sessions) {
+        batch.set(doc(db, 'sessions', session.id), sanitizeForFirestore(session), { merge: true });
+      }
+      await batch.commit();
+    } catch (e: any) {
+      console.warn('Firestore initial sessions seed notice:', e?.message || e);
+    }
+  }
+
+  /**
+   * Forces a fresh, authoritative pull of all primary collections from Cloud Firestore.
+   * Bypasses stale local caches and updates in-memory states and localStorage.
+   */
+  public async forceSyncFromFirestore(): Promise<{
+    students: number;
+    lecturers: number;
+    subjects: number;
+    sessions: number;
+    teachingAssignments: number;
+    records: number;
+  }> {
+    if (!db) {
+      throw new Error('Firestore is not initialized.');
+    }
+    if (getIsQuotaExceeded()) {
+      throw new Error('Had kuota bacaan percuma harian Firestore telah dicapai (Free daily read units exceeded). Sila cuba lagi esok atau naik taraf pelan pangkalan data.');
+    }
+
+    try {
+      // 1. Fetch Students
+      const studentsSnap = await getDocs(collection(db, 'students'));
+      if (!studentsSnap.empty) {
+        const data = studentsSnap.docs.map((docSnap) => docSnap.data() as Student);
+        const dedupedMap = new Map<string, Student>();
+        data.forEach((s) => {
+          const rawId = (s.studentId || s.id || '').trim().toUpperCase();
+          if (rawId && !dedupedMap.has(rawId)) {
+            dedupedMap.set(rawId, {
+              ...s,
+              id: rawId,
+              studentId: rawId,
+              name: (s.name || '').trim().toUpperCase(),
+              className: (s.className || 'DIA_4A').trim().toUpperCase().replace(/\s+/g, '_')
+            });
+          }
+        });
+        this.students = Array.from(dedupedMap.values());
+        this.saveStudentsLocally();
+        this.notifyStudentListeners();
+      }
+
+      // 2. Fetch Lecturers
+      const lecturersSnap = await getDocs(collection(db, 'lecturers'));
+      if (!lecturersSnap.empty) {
+        const data = lecturersSnap.docs
+          .map((docSnap) => docSnap.data() as Lecturer)
+          .filter((lec) => !DUMMY_LECTURER_IDS.includes(lec.id));
+        this.lecturers = data;
+        this.saveLecturersLocally();
+        this.notifyLecturerListeners();
+      }
+
+      // 3. Fetch Subjects
+      const subjectsSnap = await getDocs(collection(db, 'subjects'));
+      if (!subjectsSnap.empty) {
+        const data = subjectsSnap.docs
+          .map((docSnap) => docSnap.data() as Subject)
+          .filter((subj) => !DUMMY_SUBJECT_IDS.includes(subj.id));
+        this.subjects = data;
+        this.saveSubjectsLocally();
+        this.notifySubjectListeners();
+      }
+
+      // 4. Fetch Sessions
+      const sessionsSnap = await getDocs(collection(db, 'sessions'));
+      if (!sessionsSnap.empty) {
+        const data = sessionsSnap.docs
+          .map((docSnap) => docSnap.data() as AttendanceSession)
+          .filter((sess) => !DUMMY_SESSION_IDS.includes(sess.id));
+        this.sessions = sortSessionsLatestFirst(data);
+        this.saveSessionsLocally();
+        this.notifySessionListeners();
+      }
+
+      // 5. Fetch Teaching Assignments
+      const assignmentsSnap = await getDocs(collection(db, 'teaching_assignments'));
+      if (!assignmentsSnap.empty) {
+        const data = assignmentsSnap.docs.map((docSnap) => docSnap.data() as TeachingAssignment);
+        this.teachingAssignments = data;
+        this.saveTeachingAssignmentsLocally();
+        this.notifyTeachingAssignmentListeners();
+      }
+
+      // 6. Fetch Records
+      const recordsSnap = await getDocs(collection(db, 'attendance_records'));
+      if (!recordsSnap.empty) {
+        const data = recordsSnap.docs
+          .map((docSnap) => docSnap.data() as AttendanceRecord)
+          .filter(
+            (rec) =>
+              !DUMMY_RECORD_PREFIXES.some((prefix) => rec.id.startsWith(prefix)) &&
+              !DUMMY_SESSION_IDS.includes(rec.sessionId)
+          );
+        this.attendanceRecords = data;
+        this.saveRecordsLocally();
+        this.notifyRecordListeners();
+      }
+
+      // Mark initialized
+      safeStorageSet(STORAGE_KEYS.INITIALIZED, 'true');
+
+      return {
+        students: this.students.length,
+        lecturers: this.lecturers.length,
+        subjects: this.subjects.length,
+        sessions: this.sessions.length,
+        teachingAssignments: this.teachingAssignments.length,
+        records: this.attendanceRecords.length
+      };
+    } catch (err: any) {
+      const errInfo = handleFirestoreError(err, OperationType.LIST, 'forceSyncFromFirestore');
+      if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+        markQuotaExceeded(true);
+        throw new Error('Had kuota bacaan percuma harian Firestore telah dicapai (Free daily read units exceeded). Sistem beroperasi secara selamat dalam mod luar talian (LocalStorage).');
+      }
+      console.error('Error during forceSyncFromFirestore:', err);
+      throw err;
+    }
+  }
+
+  // --- Subscriptions & Shared Listeners ---
+
+  private startSharedStudentsListener() {
+    if (!db || getIsQuotaExceeded() || this.studentFirestoreUnsub) return;
+    try {
+      const q = collection(db, 'students');
+      this.studentFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            // Never overwrite with mock data; preserve authoritative local data
+            this.notifyStudentListeners();
+            return;
+          }
+
+          const data = snapshot.docs.map((docSnap) => docSnap.data() as Student);
+          const dedupedMap = new Map<string, Student>();
+          data.forEach((s) => {
+            const rawId = (s.studentId || s.id || '').trim().toUpperCase();
+            if (rawId && !dedupedMap.has(rawId)) {
+              dedupedMap.set(rawId, {
+                ...s,
+                id: rawId,
+                studentId: rawId,
+                name: (s.name || '').trim().toUpperCase(),
+                className: (s.className || 'DIA_4A').trim().toUpperCase().replace(/\s+/g, '_')
+              });
+            }
+          });
+
+          if (dedupedMap.size > 0) {
+            this.students = Array.from(dedupedMap.values());
+            this.saveStudentsLocally();
+          }
+          this.notifyStudentListeners();
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'students');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.studentFirestoreUnsub) {
+              try { this.studentFirestoreUnsub(); } catch {}
+              this.studentFirestoreUnsub = null;
+            }
+          }
+          this.notifyStudentListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED STUDENT LISTENER] Failed to attach:', e);
+      this.notifyStudentListeners();
+    }
+  }
+
+  public subscribeStudents(callback: (students: Student[]) => void): () => void {
+    this.studentListeners.add(callback);
+    callback(this.students);
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.studentListeners.delete(callback);
+      };
+    }
+
+    if (!this.studentFirestoreUnsub) {
+      this.startSharedStudentsListener();
+    }
+
+    return () => {
+      this.studentListeners.delete(callback);
+      if (this.studentListeners.size === 0 && this.studentFirestoreUnsub) {
+        try { this.studentFirestoreUnsub(); } catch {}
+        this.studentFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private startSharedEnrollmentsListener() {
+    if (!db || getIsQuotaExceeded() || this.enrollmentFirestoreUnsub) return;
+    try {
+      const q = collection(db, 'enrollments');
+      this.enrollmentFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            this.notifyEnrollmentListeners();
+            return;
+          }
+          const data = snapshot.docs.map((docSnap) => docSnap.data() as Enrollment);
+          this.enrollments = data;
+          this.saveEnrollmentsLocally();
+          this.notifyEnrollmentListeners();
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'enrollments');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.enrollmentFirestoreUnsub) {
+              try { this.enrollmentFirestoreUnsub(); } catch {}
+              this.enrollmentFirestoreUnsub = null;
+            }
+          }
+          this.notifyEnrollmentListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED ENROLLMENT LISTENER] Failed to attach:', e);
+      this.notifyEnrollmentListeners();
+    }
+  }
+
+  public subscribeEnrollments(callback: (enrollments: Enrollment[]) => void): () => void {
+    this.enrollmentListeners.add(callback);
+    callback(this.enrollments);
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.enrollmentListeners.delete(callback);
+      };
+    }
+
+    if (!this.enrollmentFirestoreUnsub) {
+      this.startSharedEnrollmentsListener();
+    }
+
+    return () => {
+      this.enrollmentListeners.delete(callback);
+      if (this.enrollmentListeners.size === 0 && this.enrollmentFirestoreUnsub) {
+        try { this.enrollmentFirestoreUnsub(); } catch {}
+        this.enrollmentFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private startSharedLecturersListener() {
+    if (!db || getIsQuotaExceeded() || this.lecturerFirestoreUnsub) return;
+    try {
+      const q = collection(db, 'lecturers');
+      this.lecturerFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            this.notifyLecturerListeners();
+            return;
+          }
+
+          const data = snapshot.docs
+            .map((docSnap) => docSnap.data() as Lecturer)
+            .filter((lec) => !DUMMY_LECTURER_IDS.includes(lec.id))
+            .map((lec) => {
+              let cleanEmail = (lec.email || '').trim().toLowerCase();
+              if (lec.id === 'LEC-KHAIRI' || lec.name.toUpperCase().includes('AHMAD KHAIRI') || cleanEmail.includes('khairi')) {
+                cleanEmail = 'khairi.mohd@mara.gov.my';
+              } else if (cleanEmail.endsWith(LEGACY_LECTURER_EMAIL_DOMAIN)) {
+                cleanEmail = convertLegacyLecturerEmail(cleanEmail);
+              }
+
+              const isAdminKhairi = cleanEmail === 'khairi.mohd@mara.gov.my' || lec.id === 'LEC-KHAIRI';
+
+              return {
+                ...lec,
+                email: cleanEmail,
+                role: (isAdminKhairi || lec.role === 'ADMIN') ? ('ADMIN' as const) : ('LECTURER' as const),
+                pin: isAdminKhairi && (!lec.pin || lec.pin === '1234') ? '5313' : (lec.pin || DEFAULT_LECTURER_PIN),
+                mustChangePin: isAdminKhairi ? false : (lec.mustChangePin ?? true),
+                assignedClasses: Array.from(new Set(lec.assignedClasses || [])),
+                assignedSections: Array.from(new Set(lec.assignedSections || [])),
+                assignedSubjects: Array.from(new Set(lec.assignedSubjects || []))
+              };
+            });
+
+          if (data.length > 0) {
+            this.lecturers = data;
+            this.syncAssignmentsToSubjectsAndLecturers(this.teachingAssignments);
+            this.saveLecturersLocally();
+          }
+          this.notifyLecturerListeners();
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'lecturers');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.lecturerFirestoreUnsub) {
+              try { this.lecturerFirestoreUnsub(); } catch {}
+              this.lecturerFirestoreUnsub = null;
+            }
+          }
+          this.notifyLecturerListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED LECTURER LISTENER] Failed to attach:', e);
+      this.notifyLecturerListeners();
+    }
+  }
+
+  public subscribeLecturers(callback: (lecturers: Lecturer[]) => void): () => void {
+    this.lecturerListeners.add(callback);
+    callback(this.lecturers);
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.lecturerListeners.delete(callback);
+      };
+    }
+
+    if (!this.lecturerFirestoreUnsub) {
+      this.startSharedLecturersListener();
+    }
+
+    return () => {
+      this.lecturerListeners.delete(callback);
+      if (this.lecturerListeners.size === 0 && this.lecturerFirestoreUnsub) {
+        try { this.lecturerFirestoreUnsub(); } catch {}
+        this.lecturerFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private startSharedSubjectsListener() {
+    if (!db || getIsQuotaExceeded() || this.subjectFirestoreUnsub) return;
+    try {
+      const q = collection(db, 'subjects');
+      this.subjectFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            this.notifySubjectListeners();
+            return;
+          }
+
+          let data = snapshot.docs
+            .map((docSnap) => docSnap.data() as Subject)
+            .filter((subj) => !DUMMY_SUBJECT_IDS.includes(subj.id));
+
+          data = data.map((subj) => {
+            let lEmail = (subj.lecturerEmail || '').trim().toLowerCase();
+            if (lEmail.includes('khairi') || subj.lecturerId === 'LEC-KHAIRI') {
+              lEmail = 'khairi.mohd@mara.gov.my';
+            } else if (lEmail.endsWith(LEGACY_LECTURER_EMAIL_DOMAIN)) {
+              lEmail = convertLegacyLecturerEmail(lEmail);
+            }
+            return {
+              ...subj,
+              lecturerEmail: lEmail || undefined
+            };
+          });
+
+          if (data.length > 0) {
+            this.subjects = data;
+            this.syncAssignmentsToSubjectsAndLecturers(this.teachingAssignments);
+            this.saveSubjectsLocally();
+          }
+          this.notifySubjectListeners();
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'subjects');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.subjectFirestoreUnsub) {
+              try { this.subjectFirestoreUnsub(); } catch {}
+              this.subjectFirestoreUnsub = null;
+            }
+          }
+          this.notifySubjectListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED SUBJECT LISTENER] Failed to attach:', e);
+      this.notifySubjectListeners();
+    }
+  }
+
+  public subscribeSubjects(callback: (subjects: Subject[]) => void): () => void {
+    this.subjectListeners.add(callback);
+    callback(this.subjects);
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.subjectListeners.delete(callback);
+      };
+    }
+
+    if (!this.subjectFirestoreUnsub) {
+      this.startSharedSubjectsListener();
+    }
+
+    return () => {
+      this.subjectListeners.delete(callback);
+      if (this.subjectListeners.size === 0 && this.subjectFirestoreUnsub) {
+        try { this.subjectFirestoreUnsub(); } catch {}
+        this.subjectFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private startSharedSessionsListener() {
+    if (!db || getIsQuotaExceeded() || this.sessionFirestoreUnsub) return;
+
+    try {
+      const q = collection(db, 'sessions');
+      this.sessionFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            // Never overwrite with mock data or sync mock data to Firestore!
+            // Preserve authoritative in-memory / localStorage sessions
+            this.notifySessionListeners();
+            return;
+          }
+
+          const rawData = snapshot.docs
+            .map((docSnap) => docSnap.data() as AttendanceSession)
+            .filter((sess) => !DUMMY_SESSION_IDS.includes(sess.id))
+            .map((sess) => {
+              let sEmail = (sess.lecturerEmail || '').trim().toLowerCase();
+              if (sEmail.includes('khairi') || sess.lecturerId === 'LEC-KHAIRI') {
+                sEmail = 'khairi.mohd@mara.gov.my';
+              } else if (sEmail.endsWith(LEGACY_LECTURER_EMAIL_DOMAIN)) {
+                sEmail = convertLegacyLecturerEmail(sEmail);
+              }
+              return {
+                ...sess,
+                lecturerEmail: sEmail || undefined
+              };
+            });
+
+          // In-memory conflict resolution (Observation separated from Reconciliation):
+          // Group by lecturer to guarantee that in-memory state always satisfies the
+          // Single Active Session invariant for UI display without triggering recursive writes
+          const openByLecturer = new Map<string, AttendanceSession[]>();
+          rawData.forEach((s) => {
+            if (s.status === 'OPEN') {
+              const key = (s.lecturerId || s.lecturerEmail || '').trim().toLowerCase();
+              if (key) {
+                const list = openByLecturer.get(key) || [];
+                list.push(s);
+                openByLecturer.set(key, list);
+              }
+            }
+          });
+
+          // Identify older conflicting sessions to resolve in memory
+          const conflictingOlderIds = new Set<string>();
+          openByLecturer.forEach((openSessions) => {
+            if (openSessions.length > 1) {
+              openSessions.sort((a, b) => {
+                const timeA = new Date(a.createdAt || a.date).getTime() || 0;
+                const timeB = new Date(b.createdAt || b.date).getTime() || 0;
+                return timeB - timeA;
+              });
+              openSessions.slice(1).forEach((older) => {
+                conflictingOlderIds.add(older.id);
+              });
+            }
+          });
+
+          const now = new Date();
+          const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+          const normalized = rawData.map((s) => {
+            if (conflictingOlderIds.has(s.id)) {
+              return {
+                ...s,
+                status: 'CLOSED' as const,
+                endTime: s.endTime && s.endTime.trim().length > 0 ? s.endTime : timeStr,
+                updatedAt: s.updatedAt || now.toISOString()
+              };
+            }
+            return s;
+          });
+
+          this.sessions = sortSessionsLatestFirst(normalized);
+          this.saveSessionsLocally();
+          this.notifySessionListeners();
+
+          // Idempotent background reconciliation: Only write to close conflicting sessions
+          // if not already in flight and quota is not exceeded
+          if (conflictingOlderIds.size > 0 && !getIsQuotaExceeded()) {
+            this.reconcileConflictingSessionsRemotely(conflictingOlderIds);
+          }
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'sessions');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.sessionFirestoreUnsub) {
+              try { this.sessionFirestoreUnsub(); } catch {}
+              this.sessionFirestoreUnsub = null;
+            }
+          }
+          // Preserve authoritative in-memory / localStorage sessions, NEVER overwrite with mock
+          this.notifySessionListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED SESSION LISTENER] Failed to attach:', e);
+      this.notifySessionListeners();
+    }
+  }
+
+  public subscribeSessions(callback: (sessions: AttendanceSession[]) => void): () => void {
+    this.sessionListeners.add(callback);
+    callback(sortSessionsLatestFirst(this.sessions));
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.sessionListeners.delete(callback);
+      };
+    }
+
+    if (!this.sessionFirestoreUnsub) {
+      this.startSharedSessionsListener();
+    }
+
+    return () => {
+      this.sessionListeners.delete(callback);
+      if (this.sessionListeners.size === 0 && this.sessionFirestoreUnsub) {
+        try { this.sessionFirestoreUnsub(); } catch {}
+        this.sessionFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private startSharedRecordsListener() {
+    if (!db || getIsQuotaExceeded() || this.recordFirestoreUnsub) return;
+    try {
+      const q = collection(db, 'attendance_records');
+      this.recordFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            this.notifyRecordListeners();
+            return;
+          }
+
+          const data = snapshot.docs
+            .map((docSnap) => docSnap.data() as AttendanceRecord)
+            .filter(
+              (rec) =>
+                !DUMMY_RECORD_PREFIXES.some((prefix) => rec.id.startsWith(prefix)) &&
+                !DUMMY_SESSION_IDS.includes(rec.sessionId)
+            );
+          this.attendanceRecords = data;
+          this.saveRecordsLocally();
+          this.notifyRecordListeners();
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'attendance_records');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.recordFirestoreUnsub) {
+              try { this.recordFirestoreUnsub(); } catch {}
+              this.recordFirestoreUnsub = null;
+            }
+          }
+          this.notifyRecordListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED RECORD LISTENER] Failed to attach:', e);
+      this.notifyRecordListeners();
+    }
+  }
+
+  public subscribeRecords(callback: (records: AttendanceRecord[]) => void): () => void {
+    this.recordListeners.add(callback);
+    callback(this.attendanceRecords);
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.recordListeners.delete(callback);
+      };
+    }
+
+    if (!this.recordFirestoreUnsub) {
+      this.startSharedRecordsListener();
+    }
+
+    return () => {
+      this.recordListeners.delete(callback);
+      if (this.recordListeners.size === 0 && this.recordFirestoreUnsub) {
+        try { this.recordFirestoreUnsub(); } catch {}
+        this.recordFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private startSharedTeachingAssignmentsListener() {
+    if (!db || getIsQuotaExceeded() || this.teachingAssignmentFirestoreUnsub) return;
+    try {
+      const q = collection(db, 'teaching_assignments');
+      this.teachingAssignmentFirestoreUnsub = onSnapshot(
+        q,
+        (snapshot) => {
+          if (snapshot.empty) {
+            this.notifyTeachingAssignmentListeners();
+            return;
+          }
+
+          let data = snapshot.docs.map((docSnap) => docSnap.data() as TeachingAssignment);
+
+          // Authoritative in-memory sanitization: Filter out invalid cross-subject class assignments
+          data = data.filter((ta) => {
+            const code = ta.subjectCode?.toUpperCase();
+            const normCls = normalizeClassCode(ta.className);
+            if (code === 'MPU2162' && normCls !== 'DIA3A') return false;
+            if (code === 'MPU2412' && normCls === 'DIA3A') return false;
+            return true;
+          });
+
+          // Sanitize incoming lecturer emails
+          data = data.map((ta) => {
+            let taEmail = (ta.lecturerEmail || '').trim().toLowerCase();
+            if (taEmail.includes('khairi') || ta.lecturerId === 'LEC-KHAIRI') {
+              taEmail = 'khairi.mohd@mara.gov.my';
+            } else if (taEmail.endsWith(LEGACY_LECTURER_EMAIL_DOMAIN)) {
+              taEmail = convertLegacyLecturerEmail(taEmail);
+            }
+            return {
+              ...ta,
+              lecturerEmail: taEmail
+            };
+          });
+
+          if (data.length > 0) {
+            this.teachingAssignments = data;
+            this.syncAssignmentsToSubjectsAndLecturers(data);
+            this.saveTeachingAssignmentsLocally();
+          }
+          this.notifyTeachingAssignmentListeners();
+        },
+        (error) => {
+          const errInfo = handleFirestoreError(error, OperationType.LIST, 'teaching_assignments');
+          if (errInfo?.category === FirestoreErrorCategory.QUOTA_EXCEEDED) {
+            markQuotaExceeded(true);
+            if (this.teachingAssignmentFirestoreUnsub) {
+              try { this.teachingAssignmentFirestoreUnsub(); } catch {}
+              this.teachingAssignmentFirestoreUnsub = null;
+            }
+          }
+          this.notifyTeachingAssignmentListeners();
+        }
+      );
+    } catch (e) {
+      console.warn('[SHARED TA LISTENER] Failed to attach:', e);
+      this.notifyTeachingAssignmentListeners();
+    }
+  }
+
+  public subscribeTeachingAssignments(callback: (assignments: TeachingAssignment[]) => void): () => void {
+    this.teachingAssignmentListeners.add(callback);
+    callback(this.teachingAssignments);
+
+    if (!db || getIsQuotaExceeded()) {
+      return () => {
+        this.teachingAssignmentListeners.delete(callback);
+      };
+    }
+
+    if (!this.teachingAssignmentFirestoreUnsub) {
+      this.startSharedTeachingAssignmentsListener();
+    }
+
+    return () => {
+      this.teachingAssignmentListeners.delete(callback);
+      if (this.teachingAssignmentListeners.size === 0 && this.teachingAssignmentFirestoreUnsub) {
+        try { this.teachingAssignmentFirestoreUnsub(); } catch {}
+        this.teachingAssignmentFirestoreUnsub = null;
+      }
+    };
+  }
+
+  private syncAssignmentsToSubjectsAndLecturers(assignments: TeachingAssignment[]) {
+    if (!assignments || assignments.length === 0) return;
+    const activeAssignments = assignments.filter((ta) => ta.status !== 'REJECTED');
+
+    // 1. Group active assignments by subject code
+    const subToClassesMap = new Map<string, Set<string>>();
+    const subToLecturerMap = new Map<string, { id: string; name: string; email: string }>();
+
+    activeAssignments.forEach((ta) => {
+      const code = (ta.subjectCode || '').trim().toUpperCase();
+      if (!code) return;
+      if (!subToClassesMap.has(code)) {
+        subToClassesMap.set(code, new Set());
+      }
+      if (ta.className) {
+        subToClassesMap.get(code)!.add(ta.className.trim().toUpperCase());
+      }
+      if (ta.lecturerId && !subToLecturerMap.has(code)) {
+        subToLecturerMap.set(code, {
+          id: ta.lecturerId,
+          name: ta.lecturerName,
+          email: ta.lecturerEmail
+        });
+      }
+    });
+
+    let subjectsChanged = false;
+    this.subjects = this.subjects.map((sub) => {
+      const code = (sub.code || '').trim().toUpperCase();
+      const assignedClasses = subToClassesMap.get(code);
+      const lecInfo = subToLecturerMap.get(code);
+
+      if (assignedClasses && assignedClasses.size > 0) {
+        const mergedSections = Array.from(new Set([...(sub.sections || []), ...Array.from(assignedClasses)]));
+        if (
+          mergedSections.length !== (sub.sections || []).length ||
+          (lecInfo && sub.lecturerId !== lecInfo.id)
+        ) {
+          subjectsChanged = true;
+          return {
+            ...sub,
+            sections: mergedSections,
+            lecturerId: lecInfo?.id || sub.lecturerId,
+            lecturerName: lecInfo?.name || sub.lecturerName,
+            lecturerEmail: lecInfo?.email || sub.lecturerEmail
+          };
+        }
+      }
+      return sub;
+    });
+
+    if (subjectsChanged) {
+      this.saveSubjectsLocally();
+      this.notifySubjectListeners();
+    }
+
+    // 2. Sync to lecturers
+    const lecToSubjectsMap = new Map<string, Set<string>>();
+    const lecToClassesMap = new Map<string, Set<string>>();
+
+    activeAssignments.forEach((ta) => {
+      const lecId = ta.lecturerId;
+      if (!lecId) return;
+      if (!lecToSubjectsMap.has(lecId)) {
+        lecToSubjectsMap.set(lecId, new Set());
+        lecToClassesMap.set(lecId, new Set());
+      }
+      lecToSubjectsMap.get(lecId)!.add(`${(ta.subjectCode || '').toUpperCase()} - ${ta.subjectName || ''}`);
+      if (ta.className) {
+        lecToClassesMap.get(lecId)!.add(ta.className.trim().toUpperCase());
+      }
+    });
+
+    let lecturersChanged = false;
+    this.lecturers = this.lecturers.map((lec) => {
+      const assignedSubs = lecToSubjectsMap.get(lec.id);
+      const assignedCls = lecToClassesMap.get(lec.id);
+      if (assignedSubs || assignedCls) {
+        const newSubs = Array.from(new Set([...(lec.assignedSubjects || []), ...(assignedSubs ? Array.from(assignedSubs) : [])]));
+        const newCls = Array.from(new Set([...(lec.assignedClasses || []), ...(assignedCls ? Array.from(assignedCls) : [])]));
+        if (newSubs.length !== (lec.assignedSubjects || []).length || newCls.length !== (lec.assignedClasses || []).length) {
+          lecturersChanged = true;
+          return {
+            ...lec,
+            assignedSubjects: newSubs,
+            assignedClasses: newCls,
+            assignedSections: newCls
+          };
+        }
+      }
+      return lec;
+    });
+
+    if (lecturersChanged) {
+      this.saveLecturersLocally();
+      this.notifyLecturerListeners();
+    }
+  }
+
+  // --- Listener Notification Dispatchers ---
+  public notifyStudentListeners() {
+    const list = [...this.students];
+    this.studentListeners.forEach((cb) => {
+      try { cb(list); } catch (e) { console.warn('Student listener notice:', e); }
+    });
+  }
+
+  public notifyLecturerListeners() {
+    const list = [...this.lecturers];
+    this.lecturerListeners.forEach((cb) => {
+      try { cb(list); } catch (e) { console.warn('Lecturer listener notice:', e); }
+    });
+  }
+
+  public notifySubjectListeners() {
+    const list = [...this.subjects];
+    this.subjectListeners.forEach((cb) => {
+      try { cb(list); } catch (e) { console.warn('Subject listener notice:', e); }
+    });
+  }
+
+  public notifySessionListeners() {
+    const list = sortSessionsLatestFirst(this.sessions);
+    this.sessionListeners.forEach((cb) => {
+      try { cb(list); } catch (e) { console.warn('Session listener notice:', e); }
+    });
+  }
+
+  public notifyRecordListeners() {
+    const list = [...this.attendanceRecords];
+    this.recordListeners.forEach((cb) => {
+      try { cb(list); } catch (e) { console.warn('Record listener notice:', e); }
+    });
+  }
+
+  public notifyTeachingAssignmentListeners() {
+    const list = [...this.teachingAssignments];
+    this.teachingAssignmentListeners.forEach((cb) => {
+      try { cb(list); } catch (e) { console.warn('Teaching assignment listener notice:', e); }
+    });
+  }
+
+  public notifyEnrollmentListeners() {
+    const list = [...this.enrollments];
+    this.enrollmentListeners.forEach((cb) => {
+      try {
+        cb(list);
+      } catch (err) {
+        console.warn('Enrollment callback error:', err);
+      }
+    });
+  }
+
+  // --- Local Persistence Helpers ---
+  private saveStudentsLocally() {
+    safeStorageSet(STORAGE_KEYS.STUDENTS, JSON.stringify(this.students));
+    this.notifyStudentListeners();
+    this.broadcastChange(STORAGE_KEYS.STUDENTS);
+  }
+
+  private saveLecturersLocally() {
+    safeStorageSet(STORAGE_KEYS.LECTURERS, JSON.stringify(this.lecturers));
+    this.notifyLecturerListeners();
+    this.broadcastChange(STORAGE_KEYS.LECTURERS);
+  }
+
+  private saveSubjectsLocally() {
+    safeStorageSet(STORAGE_KEYS.SUBJECTS, JSON.stringify(this.subjects));
+    this.notifySubjectListeners();
+    this.broadcastChange(STORAGE_KEYS.SUBJECTS);
+  }
+
+  private saveSessionsLocally() {
+    safeStorageSet(STORAGE_KEYS.SESSIONS, JSON.stringify(this.sessions));
+    this.notifySessionListeners();
+    this.broadcastChange(STORAGE_KEYS.SESSIONS);
+  }
+
+  private saveRecordsLocally() {
+    safeStorageSet(STORAGE_KEYS.RECORDS, JSON.stringify(this.attendanceRecords));
+    this.notifyRecordListeners();
+    this.broadcastChange(STORAGE_KEYS.RECORDS);
+  }
+
+  private saveEnrollmentsLocally() {
+    safeStorageSet(STORAGE_KEYS.ENROLLMENTS, JSON.stringify(this.enrollments));
+    this.notifyEnrollmentListeners();
+    this.broadcastChange(STORAGE_KEYS.ENROLLMENTS);
+  }
+
+  private saveTeachingAssignmentsLocally() {
+    safeStorageSet(STORAGE_KEYS.TEACHING_ASSIGNMENTS, JSON.stringify(this.teachingAssignments));
+    this.notifyTeachingAssignmentListeners();
+    this.broadcastChange(STORAGE_KEYS.TEACHING_ASSIGNMENTS);
+  }
+
+  private saveActiveLecturerLocally() {
+    if (this.activeLecturer) {
+      safeStorageSet(STORAGE_KEYS.ACTIVE_LECTURER, JSON.stringify(this.activeLecturer));
+    } else {
+      safeStorageRemove(STORAGE_KEYS.ACTIVE_LECTURER);
+    }
+  }
+
+  // --- Lecturer Authentication & Verification ---
+  public verifyAdminPin(pin: string): { success: boolean; lecturer?: Lecturer; message: string } {
+    const raw = pin.trim();
+    if (raw === '5313') {
+      const adminLecturer = this.lecturers.find((l) => l.role === 'ADMIN') || {
+        id: 'ADMIN-MASTER',
+        name: 'PENTADBIR SISTEM (ADMIN)',
+        email: `admin${LECTURER_EMAIL_DOMAIN}`,
+        icNumber: '******-**-5313',
+        pin: '5313',
+        department: 'Pentadbiran Kolej',
+        role: 'ADMIN' as const,
+        assignedClasses: ['DIA_4A', 'DIA_4B'],
+        assignedSubjects: ['ALL']
+      };
+
+      this.activeLecturer = adminLecturer;
+      this.saveActiveLecturerLocally();
+      return {
+        success: true,
+        lecturer: adminLecturer,
+        message: 'Akses Pentadbir (Admin) Berjaya Disahkan!'
+      };
+    }
+
+    return {
+      success: false,
+      message: 'PIN Keselamatan Pentadbir (Admin) tidak sah!'
+    };
+  }
+
+  public verifyLecturer(
+    email: string,
+    pin: string
+  ): { success: boolean; lecturer?: Lecturer; message: string; requirePinChange?: boolean } {
+    const cleanEmail = email.trim().toLowerCase();
+    const rawInput = pin.trim();
+
+    // 1. Validate email domain (must be @mara.gov.my) - STRICT FIRST CHECK
+    if (!cleanEmail.endsWith(LECTURER_EMAIL_DOMAIN)) {
+      return {
+        success: false,
+        message: `Sila gunakan emel rasmi ${LECTURER_EMAIL_DOMAIN}`
+      };
+    }
+
+    // 2. Look up lecturer in registered list
+    const foundLecturer = this.lecturers.find((l) => {
+      const lEmail = l.email.toLowerCase().trim();
+      if (lEmail === cleanEmail) return true;
+      if (
+        (cleanEmail === 'khairi.mohd@mara.gov.my' || cleanEmail === 'khairi@mara.gov.my') &&
+        (lEmail === 'khairi.mohd@mara.gov.my' || lEmail === 'khairi@mara.gov.my' || l.id === 'LEC-KHAIRI')
+      ) {
+        return true;
+      }
+      return false;
+    });
+
+    if (!foundLecturer) {
+      return {
+        success: false,
+        message: `Emel pensyarah [${cleanEmail}] belum didaftarkan dalam senarai. Sila import atau daftarkan profil pensyarah dahulu.`
+      };
+    }
+
+    // Master Admin PIN direct verification if entered
+    if (rawInput === '5313' && foundLecturer.role === 'ADMIN') {
+      this.activeLecturer = foundLecturer;
+      this.saveActiveLecturerLocally();
+      return {
+        success: true,
+        lecturer: foundLecturer,
+        message: `Akses Pentadbir Berjaya! Selamat bertugas, ${foundLecturer.name}.`,
+        requirePinChange: Boolean(foundLecturer.mustChangePin)
+      };
+    }
+
+    // 3. Verify PIN strictly against lecturer.pin (default '1234'), or Master Admin bypass ('5313')
+    const expectedPin = foundLecturer.pin || DEFAULT_LECTURER_PIN;
+    const isPinMatch = rawInput === expectedPin;
+    const isMasterBypass = rawInput === '5313';
+
+    if (isPinMatch || isMasterBypass) {
+      // Check status: if PENDING or REJECTED, block login unless admin bypass
+      if (!isMasterBypass && foundLecturer.role !== 'ADMIN') {
+        if (foundLecturer.status === 'PENDING') {
+          return {
+            success: false,
+            message: `Pendaftaran akaun bagi ${foundLecturer.name} sedang MENUNGGU KELULUSAN Pentadbir (Status: PENDING). Sila hubungi Admin untuk pengesahan.`
+          };
+        }
+        if (foundLecturer.status === 'REJECTED') {
+          return {
+            success: false,
+            message: `Pendaftaran akaun pensyarah ini telah DITOLAK (Status: REJECTED). Sila hubungi Pentadbir Kolej.`
+          };
+        }
+      }
+
+      this.activeLecturer = foundLecturer;
+      this.saveActiveLecturerLocally();
+      const requirePinChange = Boolean(foundLecturer.mustChangePin);
+
+      return {
+        success: true,
+        lecturer: foundLecturer,
+        message: `Pengesahan Berjaya! Selamat bertugas, ${foundLecturer.name}.`,
+        requirePinChange
+      };
+    }
+
+    return {
+      success: false,
+      message: `Kata laluan PIN keselamatan tidak sah untuk ${foundLecturer.name}.`
+    };
+  }
+
+  // --- Lecturer Self-Registration Engine via Admin QR ---
+  public async registerLecturerSelf(params: {
+    name: string;
+    icNumber?: string;
+    email: string;
+    phone?: string;
+    department?: string;
+    subjectAssignments: Array<{
+      subjectCode: string;
+      subjectName: string;
+      subjectId?: string;
+      classes: string[];
+    }>;
+  }): Promise<{
+    success: boolean;
+    isNewLecturer: boolean;
+    lecturer: Lecturer;
+    assignments: TeachingAssignment[];
+    message: string;
+  }> {
+    const rawName = (params.name || '').trim().toUpperCase();
+    const rawEmail = (params.email || '').trim().toLowerCase();
+    const rawIC = (params.icNumber || '').trim();
+    const rawPhone = (params.phone || '').trim();
+    const rawDept = (params.department || '').trim() || 'Jabatan Perakaunan';
+
+    if (!rawName) throw new Error('Nama penuh pensyarah diperlukan.');
+    if (!rawEmail) throw new Error('Emel rasmi pensyarah diperlukan.');
+    if (!rawEmail.endsWith(LECTURER_EMAIL_DOMAIN)) {
+      throw new Error(`Sila gunakan emel rasmi ${LECTURER_EMAIL_DOMAIN}`);
+    }
+
+    const cleanNumericIC = rawIC.replace(/[^0-9]/g, '');
+
+    if (!params.subjectAssignments || params.subjectAssignments.length === 0) {
+      throw new Error('Sila pilih sekurang-kurangnya satu subjek yang diajar.');
+    }
+
+    // 1. Deduplicate or lookup Lecturer Master
+    const existingIndex = this.lecturers.findIndex((l) => {
+      const lNumericIC = (l.icNumber || '').replace(/[^0-9]/g, '');
+      const matchIC = cleanNumericIC.length >= 6 && lNumericIC.length >= 6 && lNumericIC === cleanNumericIC;
+      const matchEmail = l.email.toLowerCase() === rawEmail;
+      return matchIC || matchEmail;
+    });
+
+    const isNewLecturer = existingIndex === -1;
+    let lecturerId = isNewLecturer ? `LEC-${Date.now()}` : this.lecturers[existingIndex].id;
+
+    // Collect all assigned classes & subjects across all chosen subjects
+    const allAssignedClassesSet = new Set<string>();
+    const allAssignedSubjectsSet = new Set<string>();
+
+    // If existing, retain previous classes/subjects as base
+    if (!isNewLecturer) {
+      (this.lecturers[existingIndex].assignedClasses || []).forEach((c) => allAssignedClassesSet.add(c));
+      (this.lecturers[existingIndex].assignedSubjects || []).forEach((s) => allAssignedSubjectsSet.add(s));
+    }
+
+    // Process new teaching assignments
+    const newAssignments: TeachingAssignment[] = [];
+    const createdTimestamp = new Date().toISOString();
+
+    params.subjectAssignments.forEach((subGroup) => {
+      const subCode = subGroup.subjectCode.trim().toUpperCase();
+      const subName = subGroup.subjectName.trim() || subCode;
+      const subId = subGroup.subjectId || `SUB-${subCode.replace(/\s+/g, '_')}`;
+      const fullSubLabel = `${subCode} - ${subName}`;
+      allAssignedSubjectsSet.add(fullSubLabel);
+
+      subGroup.classes.forEach((rawClass) => {
+        const cleanClass = rawClass.trim().toUpperCase().replace(/\s+/g, '_');
+        allAssignedClassesSet.add(cleanClass);
+
+        const assignmentId = `TA_${lecturerId}_${subCode.replace(/\s+/g, '_')}_${cleanClass}`;
+
+        const existingAssignmentIndex = this.teachingAssignments.findIndex((ta) => ta.id === assignmentId);
+
+        const assignmentObj: TeachingAssignment = {
+          id: assignmentId,
+          lecturerId,
+          lecturerEmail: rawEmail,
+          lecturerName: rawName,
+          subjectId: subId,
+          subjectCode: subCode,
+          subjectName: subName,
+          className: cleanClass,
+          status: 'PENDING',
+          createdAt: createdTimestamp
+        };
+
+        if (existingAssignmentIndex >= 0) {
+          // Update existing
+          this.teachingAssignments[existingAssignmentIndex] = {
+            ...this.teachingAssignments[existingAssignmentIndex],
+            ...assignmentObj
+          };
+          newAssignments.push(this.teachingAssignments[existingAssignmentIndex]);
+        } else {
+          // Add new assignment
+          this.teachingAssignments.push(assignmentObj);
+          newAssignments.push(assignmentObj);
+        }
+      });
+    });
+
+    const assignedClasses = Array.from(allAssignedClassesSet);
+    const assignedSubjects = Array.from(allAssignedSubjectsSet);
+
+    const existingLecturer = !isNewLecturer ? this.lecturers[existingIndex] : null;
+    const pin = existingLecturer && existingLecturer.mustChangePin === false ? existingLecturer.pin : DEFAULT_LECTURER_PIN;
+    const mustChangePin = existingLecturer && existingLecturer.mustChangePin === false ? false : true;
+    const pinChangedAt = existingLecturer && existingLecturer.mustChangePin === false ? existingLecturer.pinChangedAt : undefined;
+
+    const lecturerData: Lecturer = {
+      id: lecturerId,
+      name: rawName,
+      email: rawEmail,
+      icNumber: rawIC || undefined,
+      pin,
+      mustChangePin,
+      pinChangedAt,
+      phone: rawPhone || undefined,
+      department: rawDept,
+      assignedClasses,
+      assignedSections: assignedClasses,
+      assignedSubjects,
+      role: isNewLecturer ? 'LECTURER' : this.lecturers[existingIndex].role || 'LECTURER',
+      status: 'PENDING', // All self-registrations require Admin Approval
+      registeredAt: isNewLecturer ? createdTimestamp : this.lecturers[existingIndex].registeredAt || createdTimestamp
+    };
+
+    if (isNewLecturer) {
+      this.lecturers.push(lecturerData);
+    } else {
+      this.lecturers[existingIndex] = lecturerData;
+    }
+
+    // Persist locally
+    this.saveLecturersLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    // Persist to Firestore
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'lecturers', lecturerId), sanitizeForFirestore(lecturerData), { merge: true });
+        newAssignments.forEach((ta) => {
+          batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+        });
+        await batch.commit();
+      } catch (err) {
+        console.warn('Firestore self-registration sync notice:', err);
+      }
+    }
+
+    return {
+      success: true,
+      isNewLecturer,
+      lecturer: lecturerData,
+      assignments: newAssignments,
+      message: `Pendaftaran kendiri berjaya dihantar! Status: MENUNGGU KELULUSAN ADMIN. Sila maklumkan kepada Pentadbir untuk pengaktifan.`
+    };
+  }
+
+  // --- Admin Approval & Rejection Engine ---
+  public async approveLecturer(lecturerId: string, approvedBy: string = 'Pentadbir Sistem'): Promise<{ success: boolean; message: string }> {
+    const idx = this.lecturers.findIndex((l) => l.id === lecturerId);
+    if (idx === -1) {
+      return { success: false, message: 'Pensyarah tidak dijumpai.' };
+    }
+
+    const timestamp = new Date().toISOString();
+    const targetLecturer = this.lecturers[idx];
+    targetLecturer.status = 'ACTIVE';
+    targetLecturer.approvedAt = timestamp;
+    targetLecturer.approvedBy = approvedBy;
+
+    // Approve all their pending teaching assignments
+    this.teachingAssignments = this.teachingAssignments.map((ta) => {
+      if (ta.lecturerId === lecturerId) {
+        return {
+          ...ta,
+          status: 'ACTIVE' as const,
+          approvedAt: timestamp,
+          approvedBy
+        };
+      }
+      return ta;
+    });
+
+    this.saveLecturersLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'lecturers', lecturerId), sanitizeForFirestore(targetLecturer), { merge: true });
+        this.teachingAssignments
+          .filter((ta) => ta.lecturerId === lecturerId)
+          .forEach((ta) => {
+            batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+          });
+        await batch.commit();
+      } catch (err) {
+        console.warn('Firestore approve lecturer sync notice:', err);
+      }
+    }
+
+    return {
+      success: true,
+      message: `Pensyarah [${targetLecturer.name}] telah BERJAYA DILULUSKAN (Status: ACTIVE). Akaun kini sedia digunakan!`
+    };
+  }
+
+  public async rejectLecturer(lecturerId: string, reason?: string): Promise<{ success: boolean; message: string }> {
+    const idx = this.lecturers.findIndex((l) => l.id === lecturerId);
+    if (idx === -1) {
+      return { success: false, message: 'Pensyarah tidak dijumpai.' };
+    }
+
+    const targetLecturer = this.lecturers[idx];
+    targetLecturer.status = 'REJECTED';
+
+    this.teachingAssignments = this.teachingAssignments.map((ta) => {
+      if (ta.lecturerId === lecturerId) {
+        return {
+          ...ta,
+          status: 'REJECTED' as const
+        };
+      }
+      return ta;
+    });
+
+    this.saveLecturersLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'lecturers', lecturerId), sanitizeForFirestore(targetLecturer), { merge: true });
+        this.teachingAssignments
+          .filter((ta) => ta.lecturerId === lecturerId)
+          .forEach((ta) => {
+            batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+          });
+        await batch.commit();
+      } catch (err) {
+        console.warn('Firestore reject lecturer sync notice:', err);
+      }
+    }
+
+    return {
+      success: true,
+      message: `Pendaftaran pensyarah [${targetLecturer.name}] telah DITOLAK (REJECTED).`
+    };
+  }
+
+  public deleteTeachingAssignment(assignmentId: string) {
+    this.teachingAssignments = this.teachingAssignments.filter((ta) => ta.id !== assignmentId);
+    this.saveTeachingAssignmentsLocally();
+    if (db) {
+      deleteDoc(doc(db, 'teaching_assignments', assignmentId)).catch(console.warn);
+    }
+  }
+
+  /**
+   * Admin: Assign or update subjects taught by a specific lecturer.
+   * Synchronizes:
+   * 1. Old teaching assignments removed for this lecturer.
+   * 2. New TeachingAssignment records generated with status 'ACTIVE'.
+   * 3. Lecturer profile updated with assignedSubjects, assignedClasses, assignedSections.
+   * 4. Subject master records updated (linking lecturerId, lecturerName, lecturerEmail or unlinking).
+   * 5. LocalStorage and Firestore synced atomically.
+   */
+  public async setLecturerAssignments(
+    lecturerId: string,
+    subjectAssignments: Array<{
+      subjectCode: string;
+      subjectName: string;
+      department?: string;
+      classes: string[];
+    }>
+  ): Promise<{ success: boolean; message: string; assignments: TeachingAssignment[] }> {
+    const idx = this.lecturers.findIndex((l) => l.id === lecturerId);
+    if (idx === -1) {
+      return { success: false, message: 'Pensyarah tidak dijumpai.', assignments: [] };
+    }
+
+    const lecturer = this.lecturers[idx];
+    const createdTimestamp = new Date().toISOString();
+
+    // 1. Identify previous assignment IDs to delete from Firestore
+    const previousAssignmentIds = this.teachingAssignments
+      .filter((ta) => ta.lecturerId === lecturerId)
+      .map((ta) => ta.id);
+
+    // Remove previous assignments locally
+    this.teachingAssignments = this.teachingAssignments.filter((ta) => ta.lecturerId !== lecturerId);
+
+    // 2. Build new TeachingAssignments
+    const newAssignments: TeachingAssignment[] = [];
+    const allAssignedSections = new Set<string>();
+    const allAssignedSubjects: string[] = [];
+
+    subjectAssignments.forEach((sa) => {
+      const cleanSubCode = sa.subjectCode.trim().toUpperCase();
+      const cleanSubName = sa.subjectName.trim();
+      allAssignedSubjects.push(`${cleanSubCode} - ${cleanSubName}`);
+
+      const subClasses = (sa.classes && sa.classes.length > 0)
+        ? Array.from(new Set(sa.classes.map((c) => c.trim().toUpperCase()).filter(Boolean)))
+        : ['DIA_1A', 'DIA_1B'];
+      subClasses.forEach((cls) => {
+        const cleanClass = cls.trim().toUpperCase();
+        allAssignedSections.add(cleanClass);
+
+        const assignmentId = `TA_${lecturer.id}_${cleanSubCode.replace(/[^A-Z0-9]/g, '')}_${cleanClass.replace(/[^A-Z0-9]/g, '')}`;
+        newAssignments.push({
+          id: assignmentId,
+          lecturerId: lecturer.id,
+          lecturerEmail: lecturer.email,
+          lecturerName: lecturer.name,
+          subjectId: `SUB-${cleanSubCode.replace(/[^A-Z0-9]/g, '')}`,
+          subjectCode: cleanSubCode,
+          subjectName: cleanSubName,
+          className: cleanClass,
+          status: 'ACTIVE',
+          createdAt: createdTimestamp,
+          approvedAt: createdTimestamp,
+          approvedBy: 'Pentadbir Sistem'
+        });
+      });
+    });
+
+    // Append new assignments to local state
+    this.teachingAssignments = [...this.teachingAssignments, ...newAssignments];
+
+    // 3. Update Lecturer profile
+    const assignedClassesArray = Array.from(allAssignedSections);
+    lecturer.assignedSubjects = allAssignedSubjects;
+    lecturer.assignedSections = assignedClassesArray.length > 0 ? assignedClassesArray : ['DIA_1A'];
+    lecturer.assignedClasses = lecturer.assignedSections;
+    this.lecturers[idx] = lecturer;
+
+    // 4. Update Subject records: link this lecturer to their assigned subjects
+    const assignedSubCodeSet = new Set(subjectAssignments.map((sa) => sa.subjectCode.trim().toUpperCase()));
+    this.subjects = this.subjects.map((sub) => {
+      const code = sub.code.trim().toUpperCase();
+      if (assignedSubCodeSet.has(code)) {
+        return {
+          ...sub,
+          lecturerId: lecturer.id,
+          lecturerName: lecturer.name,
+          lecturerEmail: lecturer.email
+        };
+      } else if (sub.lecturerId === lecturer.id) {
+        // If it was previously assigned to this lecturer but no longer in the list
+        return {
+          ...sub,
+          lecturerId: undefined,
+          lecturerName: undefined,
+          lecturerEmail: undefined
+        };
+      }
+      return sub;
+    });
+
+    // 5. Persist locally
+    this.saveLecturersLocally();
+    this.saveTeachingAssignmentsLocally();
+    this.saveSubjectsLocally();
+
+    // 6. Persist to Firestore via batch
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+
+        // Update Lecturer doc
+        batch.set(doc(db, 'lecturers', lecturer.id), sanitizeForFirestore(lecturer), { merge: true });
+
+        // Delete old assignments
+        previousAssignmentIds.forEach((oldId) => {
+          batch.delete(doc(db, 'teaching_assignments', oldId));
+        });
+
+        // Write new assignments
+        newAssignments.forEach((ta) => {
+          batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+        });
+
+        // Update affected subjects in Firestore
+        this.subjects
+          .filter((s) => assignedSubCodeSet.has(s.code.trim().toUpperCase()) || s.lecturerId === lecturer.id)
+          .forEach((s) => {
+            batch.set(doc(db, 'subjects', s.id), sanitizeForFirestore(s), { merge: true });
+          });
+
+        // Fast background commit with timeout safeguard so UI never stalls
+        const commitPromise = batch.commit().catch((err) => {
+          console.warn('Background Firestore setLecturerAssignments notice:', err?.message || err);
+        });
+        const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 1200));
+        await Promise.race([commitPromise, timeoutPromise]);
+      } catch (err) {
+        console.warn('Firestore setLecturerAssignments sync warning:', err);
+      }
+    }
+
+    return {
+      success: true,
+      message: `Subjek yang diajar oleh ${lecturer.name} telah berjaya dikemaskini (${newAssignments.length} tugasan kelas).`,
+      assignments: newAssignments
+    };
+  }
+
+  /**
+   * Allows a lecturer to configure and save which subjects and classes they teach.
+   * Eliminates automatic system assignment - autonomy given to lecturers.
+   */
+  public async updateLecturerTeachingAssignments(
+    lecturerId: string,
+    subjectAssignments: {
+      subjectCode: string;
+      subjectName: string;
+      department?: string;
+      classes: string[];
+    }[]
+  ): Promise<{ success: boolean; message: string }> {
+    const targetLecturerIndex = this.lecturers.findIndex((l) => l.id === lecturerId);
+    if (targetLecturerIndex < 0) {
+      return { success: false, message: 'Rekod pensyarah tidak dijumpai.' };
+    }
+
+    const lecturer = this.lecturers[targetLecturerIndex];
+    const oldAssignments = this.teachingAssignments.filter((ta) => ta.lecturerId === lecturerId);
+
+    // Filter out old assignments for this lecturer
+    this.teachingAssignments = this.teachingAssignments.filter((ta) => ta.lecturerId !== lecturerId);
+
+    const newAssignments: TeachingAssignment[] = [];
+    const allAssignedClasses = new Set<string>();
+    const allAssignedSubjects = new Set<string>();
+    const createdTimestamp = new Date().toISOString();
+
+    subjectAssignments.forEach((sg) => {
+      const subCode = sg.subjectCode.trim().toUpperCase();
+      const subName = sg.subjectName.trim() || subCode;
+      const fullSubLabel = `${subCode} - ${subName}`;
+      allAssignedSubjects.add(fullSubLabel);
+
+      sg.classes.forEach((cls) => {
+        const cleanClass = cls.trim().toUpperCase().replace(/\s+/g, '_');
+        allAssignedClasses.add(cleanClass);
+        const assignmentId = `TA_${lecturerId}_${subCode.replace(/\s+/g, '_')}_${cleanClass}`;
+        const assignmentObj: TeachingAssignment = {
+          id: assignmentId,
+          lecturerId,
+          lecturerEmail: lecturer.email,
+          lecturerName: lecturer.name,
+          subjectId: `SUB-${subCode.replace(/\s+/g, '_')}`,
+          subjectCode: subCode,
+          subjectName: subName,
+          className: cleanClass,
+          status: 'ACTIVE',
+          createdAt: createdTimestamp
+        };
+        newAssignments.push(assignmentObj);
+        this.teachingAssignments.push(assignmentObj);
+      });
+    });
+
+    const updatedLecturer: Lecturer = {
+      ...lecturer,
+      assignedClasses: Array.from(allAssignedClasses),
+      assignedSections: Array.from(allAssignedClasses),
+      assignedSubjects: Array.from(allAssignedSubjects)
+    };
+
+    this.lecturers[targetLecturerIndex] = updatedLecturer;
+    if (this.activeLecturer?.id === lecturerId) {
+      this.activeLecturer = updatedLecturer;
+      this.saveActiveLecturerLocally();
+    }
+
+    // Also update this.subjects to link with this lecturer and save assigned classes
+    const assignedCodeSet = new Set(subjectAssignments.map((sa) => sa.subjectCode.trim().toUpperCase()));
+    const modifiedSubjects: Subject[] = [];
+    this.subjects = this.subjects.map((sub) => {
+      const codeUpper = sub.code.trim().toUpperCase();
+      if (assignedCodeSet.has(codeUpper)) {
+        const matchedAssignment = subjectAssignments.find(
+          (sa) => sa.subjectCode.trim().toUpperCase() === codeUpper
+        );
+        const selectedClasses = matchedAssignment?.classes && matchedAssignment.classes.length > 0
+          ? Array.from(new Set(matchedAssignment.classes.map((c) => c.trim().toUpperCase().replace(/\s+/g, '_'))))
+          : [];
+        const updated: Subject = {
+          ...sub,
+          lecturerId,
+          lecturerName: lecturer.name,
+          lecturerEmail: lecturer.email,
+          sections: selectedClasses.length > 0 ? selectedClasses : (sub.sections || [])
+        };
+        modifiedSubjects.push(updated);
+        return updated;
+      } else if (sub.lecturerId === lecturerId) {
+        const updated: Subject = {
+          ...sub,
+          lecturerId: undefined,
+          lecturerName: 'Belum Ditetapkan',
+          lecturerEmail: undefined
+        };
+        modifiedSubjects.push(updated);
+        return updated;
+      }
+      return sub;
+    });
+
+    // If there are subjects in subjectAssignments that weren't in this.subjects, add them
+    subjectAssignments.forEach((sa) => {
+      const codeUpper = sa.subjectCode.trim().toUpperCase();
+      if (!this.subjects.some((s) => s.code.trim().toUpperCase() === codeUpper)) {
+        const selectedClasses = sa.classes && sa.classes.length > 0
+          ? Array.from(new Set(sa.classes.map((c) => c.trim().toUpperCase().replace(/\s+/g, '_'))))
+          : [];
+        const newSub: Subject = {
+          id: `SUB-${codeUpper.replace(/\s+/g, '_')}`,
+          code: codeUpper,
+          name: sa.subjectName || codeUpper,
+          department: sa.department || 'Jabatan Pengajian Am',
+          sections: selectedClasses,
+          lecturerId,
+          lecturerName: lecturer.name,
+          lecturerEmail: lecturer.email,
+          status: 'ACTIVE'
+        };
+        this.subjects.push(newSub);
+        modifiedSubjects.push(newSub);
+      }
+    });
+
+    this.saveSubjectsLocally();
+    this.saveLecturersLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        // Remove old assignments from Firestore
+        oldAssignments.forEach((ta) => {
+          batch.delete(doc(db!, 'teaching_assignments', ta.id));
+        });
+        // Save new assignments to Firestore
+        newAssignments.forEach((ta) => {
+          batch.set(doc(db!, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+        });
+        // Update lecturer profile with their assigned subjects & classes
+        batch.set(doc(db!, 'lecturers', lecturerId), sanitizeForFirestore(updatedLecturer), { merge: true });
+        // Update subject records in Firestore
+        modifiedSubjects.forEach((sub) => {
+          batch.set(doc(db!, 'subjects', sub.id), sanitizeForFirestore(sub), { merge: true });
+        });
+
+        // Fast background commit with timeout safeguard so UI never stalls or stays pending
+        const commitPromise = batch.commit().catch((err) => {
+          console.warn('Background Firestore update teaching assignments notice:', err?.message || err);
+        });
+        const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 1200));
+        await Promise.race([commitPromise, timeoutPromise]);
+      } catch (err) {
+        console.warn('Firestore update teaching assignments error:', err);
+      }
+    }
+
+    return {
+      success: true,
+      message: 'Penugasan subjek dan kelas pengajaran anda berjaya disimpan.'
+    };
+  }
+
+  /**
+   * Returns the strictly assigned classes for a subject.
+   * Priority:
+   * 1. Teaching assignments for this subject (if any exist)
+   * 2. Subject.sections (if defined and non-empty)
+   * 3. Empty array if not restricted.
+   */
+  public getAssignedClassesForSubject(subjectCode: string, lecturerId?: string): string[] {
+    if (!subjectCode) return [];
+    const codeUpper = subjectCode.trim().toUpperCase();
+
+    // 1. Check teaching assignments for this subject
+    const assignments = this.teachingAssignments.filter((ta) => {
+      const matchCode = ta.subjectCode.trim().toUpperCase() === codeUpper;
+      const matchStatus = ta.status !== 'REJECTED';
+      if (!lecturerId) return matchCode && matchStatus;
+      const matchLec =
+        ta.lecturerId === lecturerId ||
+        ta.lecturerEmail?.toLowerCase() === lecturerId.toLowerCase() ||
+        ta.lecturerName?.toLowerCase().includes(lecturerId.toLowerCase());
+      return matchCode && matchStatus && matchLec;
+    });
+
+    if (assignments.length > 0) {
+      const clsSet = new Set<string>();
+      assignments.forEach((ta) => {
+        if (ta.className && ta.className.trim()) {
+          clsSet.add(ta.className.trim().toUpperCase());
+        }
+      });
+      if (clsSet.size > 0) {
+        return Array.from(clsSet).sort();
+      }
+    }
+
+    // 2. Check subject.sections
+    const sub = this.subjects.find((s) => s.code.trim().toUpperCase() === codeUpper);
+    if (sub && sub.sections && sub.sections.length > 0) {
+      return Array.from(new Set(sub.sections.map((sec) => sec.trim().toUpperCase()).filter(Boolean))).sort();
+    }
+
+    return [];
+  }
+
+  public getTeachingAssignments(): TeachingAssignment[] {
+    return [...this.teachingAssignments];
+  }
+
+  public getTeachingAssignmentsForLecturer(lecturerIdOrEmail: string): TeachingAssignment[] {
+    const query = lecturerIdOrEmail.trim().toLowerCase();
+    return this.teachingAssignments.filter(
+      (ta) =>
+        ta.lecturerId.toLowerCase() === query ||
+        ta.lecturerEmail.toLowerCase() === query ||
+        ta.lecturerName.toLowerCase().includes(query)
+    );
+  }
+
+  public getLecturerAssignedSubjectCodes(lecturer: Lecturer | null | undefined): string[] {
+    if (!lecturer) return [];
+    const codes = new Set<string>();
+    const lecId = (lecturer.id || '').trim().toLowerCase();
+    const lecEmail = (lecturer.email || '').trim().toLowerCase();
+    const lecName = (lecturer.name || '').trim().toLowerCase();
+
+    // 1. From teaching assignments
+    this.teachingAssignments.forEach((ta) => {
+      const matchId = ta.lecturerId && ta.lecturerId.toLowerCase() === lecId;
+      const matchEmail = ta.lecturerEmail && ta.lecturerEmail.toLowerCase() === lecEmail;
+      const matchName = ta.lecturerName && ta.lecturerName.toLowerCase().includes(lecName);
+      if (matchId || matchEmail || matchName) {
+        if (ta.subjectCode) codes.add(ta.subjectCode.trim().toUpperCase());
+      }
+    });
+
+    // 2. From lecturer.assignedSubjects
+    (lecturer.assignedSubjects || []).forEach((subStr) => {
+      const code = subStr.includes('-') ? subStr.split('-')[0].trim().toUpperCase() : subStr.trim().toUpperCase();
+      if (code) codes.add(code);
+    });
+
+    // 3. From subjects master list matching lecturer
+    this.subjects.forEach((s) => {
+      const matchId = s.lecturerId && s.lecturerId.toLowerCase() === lecId;
+      const matchEmail = s.lecturerEmail && s.lecturerEmail.toLowerCase() === lecEmail;
+      const matchName = s.lecturerName && s.lecturerName.toLowerCase().includes(lecName);
+      if (matchId || matchEmail || matchName) {
+        codes.add(s.code.trim().toUpperCase());
+      }
+    });
+
+    return Array.from(codes);
+  }
+
+  public getSubjectsForLecturer(lecturer: Lecturer | null | undefined): Subject[] {
+    if (!lecturer) return [];
+    const codes = new Set(this.getLecturerAssignedSubjectCodes(lecturer));
+    return this.subjects.filter((s) => codes.has(s.code.trim().toUpperCase()));
+  }
+
+  /**
+   * Updates assigned classes for a specific subject and lecturer, synchronizing both
+   * the subject's section catalog and active Teaching Assignments in real-time.
+   */
+  public updateSubjectClasses(
+    subjectCode: string,
+    newClasses: string[],
+    lecturer?: Lecturer | null
+  ): { subjects: Subject[]; teachingAssignments: TeachingAssignment[] } {
+    const normCode = subjectCode.trim().toUpperCase();
+    const cleanClasses = Array.from(new Set(newClasses.map((c) => c.trim().toUpperCase()).filter(Boolean)));
+
+    // 1. Update subject.sections
+    const subIdx = this.subjects.findIndex((s) => s.code.toUpperCase() === normCode);
+    if (subIdx >= 0) {
+      this.subjects[subIdx] = {
+        ...this.subjects[subIdx],
+        sections: cleanClasses
+      };
+      this.saveSubject(this.subjects[subIdx]);
+    }
+
+    // 2. Update teaching assignments for this subject & lecturer
+    const targetLecturer = lecturer || this.activeLecturer;
+    if (targetLecturer) {
+      const lecId = targetLecturer.id;
+      const lecName = targetLecturer.name;
+      const lecEmail = targetLecturer.email;
+
+      // Keep teaching assignments for other subjects or other lecturers
+      const otherTas = this.teachingAssignments.filter(
+        (ta) =>
+          !(
+            ta.subjectCode?.toUpperCase() === normCode &&
+            (ta.lecturerId === lecId ||
+              (ta.lecturerEmail && ta.lecturerEmail.toLowerCase() === lecEmail.toLowerCase()) ||
+              (ta.lecturerName && ta.lecturerName.toLowerCase() === lecName.toLowerCase()))
+          )
+      );
+
+      // Create new active assignments for each selected class
+      const newTas: TeachingAssignment[] = cleanClasses.map((cls) => ({
+        id: `TA-${lecId}-${normCode}-${cls}`,
+        lecturerId: lecId,
+        lecturerName: lecName,
+        lecturerEmail: lecEmail,
+        subjectId: this.subjects[subIdx]?.id || `SUB-${normCode}`,
+        subjectCode: normCode,
+        subjectName: this.subjects[subIdx]?.name || normCode,
+        className: cls,
+        status: 'ACTIVE',
+        createdAt: new Date().toISOString()
+      }));
+
+      this.teachingAssignments = [...otherTas, ...newTas];
+      this.saveTeachingAssignmentsLocally();
+
+      if (db) {
+        try {
+          const batch = writeBatch(db);
+          newTas.forEach((ta) => {
+            batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+          });
+          batch.commit().catch(console.warn);
+        } catch (e) {
+          console.warn('Batch teaching assignments update error:', e);
+        }
+      }
+    }
+
+    return {
+      subjects: [...this.subjects],
+      teachingAssignments: [...this.teachingAssignments]
+    };
+  }
+
+  public getPendingLecturers(): Lecturer[] {
+    return this.lecturers.filter((l) => l.status === 'PENDING');
+  }
+
+  public registerLecturer(lecturer: Lecturer): { success: boolean; message: string } {
+    const cleanEmail = lecturer.email.trim().toLowerCase();
+    if (!cleanEmail.endsWith(LECTURER_EMAIL_DOMAIN)) {
+      return {
+        success: false,
+        message: `Sila gunakan emel rasmi ${LECTURER_EMAIL_DOMAIN}`
+      };
+    }
+
+    const cleanIC = lecturer.icNumber ? lecturer.icNumber.trim() : '';
+
+    const existingIdx = this.lecturers.findIndex((l) => l.email.toLowerCase() === cleanEmail);
+    const existing = existingIdx >= 0 ? this.lecturers[existingIdx] : null;
+
+    const pin = existing && existing.mustChangePin === false ? existing.pin : DEFAULT_LECTURER_PIN;
+    const mustChangePin = existing && existing.mustChangePin === false ? false : true;
+    const pinChangedAt = existing && existing.mustChangePin === false ? existing.pinChangedAt : undefined;
+
+    const newLecturer: Lecturer = {
+      ...lecturer,
+      email: cleanEmail,
+      icNumber: cleanIC || undefined,
+      pin,
+      mustChangePin,
+      pinChangedAt
+    };
+
+    if (existingIdx >= 0) {
+      this.lecturers[existingIdx] = newLecturer;
+    } else {
+      this.lecturers.push(newLecturer);
+    }
+
+    this.saveLecturersLocally();
+    if (db) {
+      setDoc(doc(db, 'lecturers', newLecturer.id), sanitizeForFirestore(newLecturer), { merge: true }).catch(console.warn);
+    }
+
+    return {
+      success: true,
+      message: `Pensyarah berjaya didaftarkan. Kata laluan lalai akaun adalah [${DEFAULT_LECTURER_PIN}]. Sila tukar pada log masuk pertama.`
+    };
+  }
+
+  /**
+   * Import Lecturers from CSV with Automatic Subject and Class Allocation
+   * Directly establishes:
+   * 1. Lecturer records with credentials (email, ic, 4-digit PIN, department, role)
+   * 2. Registers subjects into the master subject catalog (with official title & department)
+   * 3. Links lecturers to their subjects (lecturerId, lecturerName, lecturerEmail)
+   * 4. Updates subject sections to include all allocated classes from CSV
+   * 5. Automatically generates ACTIVE TeachingAssignment records for each lecturer-subject-class combo
+   * 6. Atomically updates local state, LocalStorage, and Firestore via Batch
+   */
+  /**
+   * Helper to find an existing lecturer by:
+   * 1. ID
+   * 2. official MARA email (@mara.gov.my)
+   * 3. legacy email (@bpenawar.kpm.edu.my)
+   * 4. normalized full name
+   * Prevents duplicate records across imports and migrations.
+   */
+  public findMatchingExistingLecturer(
+    incoming: Partial<Lecturer> & { emailKpm?: string; legacyEmail?: string },
+    pool?: Lecturer[]
+  ): Lecturer | undefined {
+    const list = pool || this.lecturers;
+
+    // 1. Match by ID
+    if (incoming.id) {
+      const match = list.find((l) => l.id === incoming.id);
+      if (match) return match;
+    }
+
+    const inEmail = (incoming.email || '').trim().toLowerCase();
+    const inLegacy = (incoming.legacyEmail || (incoming as any).emailKpm || '').trim().toLowerCase();
+
+    // 2. Match by MARA email directly or converted
+    if (inEmail) {
+      const match = list.find((l) => l.email.trim().toLowerCase() === inEmail);
+      if (match) return match;
+
+      // Special alias check for Khairi Mohd
+      if (inEmail === 'khairi.mohd@mara.gov.my' || inEmail === 'khairi@mara.gov.my') {
+        const khairiMatch = list.find(
+          (l) => l.id === 'LEC-KHAIRI' || l.email.toLowerCase().includes('khairi') || l.name.toUpperCase().includes('AHMAD KHAIRI')
+        );
+        if (khairiMatch) return khairiMatch;
+      }
+
+      // If incoming email is @mara.gov.my, check if existing has legacy @bpenawar.kpm.edu.my
+      if (inEmail.endsWith(LECTURER_EMAIL_DOMAIN)) {
+        const legacyCounterpart = inEmail.replace(LECTURER_EMAIL_DOMAIN, LEGACY_LECTURER_EMAIL_DOMAIN);
+        const matchLegacy = list.find((l) => l.email.trim().toLowerCase() === legacyCounterpart);
+        if (matchLegacy) return matchLegacy;
+      }
+
+      // If incoming email is legacy @bpenawar.kpm.edu.my, check if existing has @mara.gov.my
+      const maraCounterpart = convertLegacyLecturerEmail(inEmail).toLowerCase();
+      if (maraCounterpart && maraCounterpart !== inEmail) {
+        const matchMara = list.find((l) => l.email.trim().toLowerCase() === maraCounterpart);
+        if (matchMara) return matchMara;
+      }
+    }
+
+    // 3. Match by legacy email field if provided
+    if (inLegacy) {
+      const match = list.find((l) => l.email.trim().toLowerCase() === inLegacy);
+      if (match) return match;
+    }
+
+    // 4. Match by normalized name
+    if (incoming.name) {
+      const normIn = normalizeLecturerName(incoming.name);
+      if (normIn.length >= 3) {
+        const match = list.find((l) => normalizeLecturerName(l.name) === normIn);
+        if (match) return match;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * Import Lecturers from CSV with Automatic Subject and Class Allocation
+   * Directly establishes:
+   * 1. Lecturer records with credentials (email, ic, 4-digit PIN, department, role)
+   * 2. Registers subjects into the master subject catalog (with official title & department)
+   * 3. Links lecturers to their subjects (lecturerId, lecturerName, lecturerEmail)
+   * 4. Updates subject sections to include all allocated classes from CSV
+   * 5. Automatically generates ACTIVE TeachingAssignment records for each lecturer-subject-class combo
+   * 6. Atomically updates local state, LocalStorage, and Firestore via Batch
+   */
+  public async importLecturersWithAssignments(
+    newLecturersList: Lecturer[]
+  ): Promise<{
+    success: boolean;
+    message: string;
+    lecturers: Lecturer[];
+    subjects: Subject[];
+    assignments: TeachingAssignment[];
+  }> {
+    const timestamp = new Date().toISOString();
+
+    // Map existing state by ID to prevent duplicate records
+    const lecturersById = new Map<string, Lecturer>(
+      this.lecturers.map((l) => [l.id, l])
+    );
+
+    const updatedSubjectsMap = new Map<string, Subject>(
+      this.subjects.map((s) => [s.code.toUpperCase().trim(), s])
+    );
+
+    const assignmentsMap = new Map<string, TeachingAssignment>(
+      this.teachingAssignments.map((ta) => [ta.id, ta])
+    );
+
+    const newlyProcessedLecturers: Lecturer[] = [];
+
+    for (const incoming of newLecturersList) {
+      // Find matching existing lecturer by id, MARA email, legacy email, or normalized name
+      const existing = this.findMatchingExistingLecturer(incoming, Array.from(lecturersById.values()));
+
+      // Normalize email to official MARA format
+      let email = (incoming.email || '').toLowerCase().trim();
+      if (!email.endsWith(LECTURER_EMAIL_DOMAIN)) {
+        email = convertLegacyLecturerEmail(email);
+      }
+      if (!email && existing) {
+        email = existing.email.toLowerCase().trim();
+      }
+
+      const lecturerId =
+        existing?.id ||
+        incoming.id ||
+        `LEC-${email.split('@')[0].toUpperCase().replace(/[^A-Z0-9]/g, '')}`;
+
+      const name = (incoming.name || existing?.name || 'Pensyarah').trim().toUpperCase();
+      const icNumber = incoming.icNumber || existing?.icNumber || '';
+
+      // Rule 1: PIN Overwrite rules
+      // - If lecturer already has pinChangedAt: PRESERVE pin and mustChangePin = false. Do NOT overwrite.
+      // - If lecturer does NOT have pinChangedAt: set pin = '1234' and mustChangePin = true.
+      let pin = DEFAULT_LECTURER_PIN;
+      let mustChangePin = true;
+      let pinChangedAt: string | undefined = undefined;
+
+      if (existing) {
+        if (existing.pinChangedAt) {
+          pin = existing.pin || DEFAULT_LECTURER_PIN;
+          mustChangePin = false;
+          pinChangedAt = existing.pinChangedAt;
+        } else {
+          pin = DEFAULT_LECTURER_PIN;
+          mustChangePin = true;
+          pinChangedAt = undefined;
+        }
+      } else {
+        // Brand new lecturer from CSV
+        pin = DEFAULT_LECTURER_PIN;
+        mustChangePin = true;
+        pinChangedAt = undefined;
+      }
+
+      const department = incoming.department || existing?.department || 'Jabatan Pengajian Am';
+
+      // Rule 1: Existing ADMIN role CANNOT be downgraded to LECTURER
+      const role = existing?.role === 'ADMIN' ? 'ADMIN' : (incoming.role || existing?.role || 'LECTURER');
+
+      // Parse and clean classes from CSV
+      const rawClasses =
+        incoming.assignedSections ||
+        incoming.assignedClasses ||
+        existing?.assignedSections ||
+        existing?.assignedClasses ||
+        [];
+      const assignedClasses = splitClassNames(
+        Array.isArray(rawClasses) ? rawClasses.join(', ') : String(rawClasses)
+      );
+
+      // Parse and clean subjects from CSV
+      const rawSubjects = incoming.assignedSubjects || existing?.assignedSubjects || [];
+      const assignedSubjectCodes: string[] = [];
+      const formattedSubjectLabels: string[] = [];
+
+      rawSubjects.forEach((subEntry) => {
+        let code = '';
+        let titleFromEntry = '';
+        if (subEntry.includes('-')) {
+          const parts = subEntry.split('-');
+          code = parts[0].trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+          titleFromEntry = parts.slice(1).join('-').trim().toUpperCase();
+        } else {
+          code = subEntry.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+        }
+
+        if (!code) return;
+        assignedSubjectCodes.push(code);
+
+        // Check if known in dictionary or existing
+        const existingSub = updatedSubjectsMap.get(code);
+        const known = KNOWN_KPM_COURSES[code];
+        const subName = titleFromEntry || existingSub?.name || known?.name || `KURSUS ${code}`;
+        const subDept =
+          existingSub?.department ||
+          known?.department ||
+          deduceDepartmentFromCode(code) ||
+          department;
+
+        const fullLabel = `${code} - ${subName}`;
+        formattedSubjectLabels.push(fullLabel);
+
+        // Subject sections: merge with assignedClasses
+        const existingSections = existingSub?.sections || [];
+        const mergedSections = splitClassNames(
+          [...existingSections, ...assignedClasses].join(', ')
+        );
+
+        const subjectRecord: Subject = {
+          id: existingSub?.id || `SUB-${code}`,
+          code: code,
+          name: subName,
+          department: subDept,
+          sections: mergedSections.length > 0 ? mergedSections : assignedClasses,
+          lecturerId: lecturerId,
+          lecturerName: name,
+          lecturerEmail: email,
+          status: 'ACTIVE'
+        };
+
+        updatedSubjectsMap.set(code, subjectRecord);
+
+        // Generate TeachingAssignment for each allocated class
+        const targetClasses =
+          assignedClasses.length > 0
+            ? assignedClasses
+            : existingSub?.sections && existingSub.sections.length > 0
+            ? existingSub.sections
+            : ['DIA_4A'];
+
+        targetClasses.forEach((cls) => {
+          const cleanClass = cls.trim().toUpperCase();
+          const assignmentId = `TA_${lecturerId}_${code}_${cleanClass.replace(/[^A-Z0-9]/g, '')}`;
+
+          assignmentsMap.set(assignmentId, {
+            id: assignmentId,
+            lecturerId: lecturerId,
+            lecturerEmail: email,
+            lecturerName: name,
+            subjectId: subjectRecord.id,
+            subjectCode: code,
+            subjectName: subName,
+            className: cleanClass,
+            status: 'ACTIVE',
+            createdAt: timestamp,
+            approvedAt: timestamp,
+            approvedBy: 'Auto-Import CSV'
+          });
+        });
+      });
+
+      const updatedLecturer: Lecturer = {
+        id: lecturerId,
+        name: name,
+        email: email,
+        icNumber: icNumber || undefined,
+        pin: pin,
+        mustChangePin: mustChangePin,
+        pinChangedAt: pinChangedAt,
+        phone: incoming.phone || existing?.phone,
+        department: department,
+        role: role,
+        status: 'ACTIVE',
+        assignedClasses: assignedClasses,
+        assignedSections: assignedClasses,
+        assignedSubjects: formattedSubjectLabels.length > 0 ? formattedSubjectLabels : rawSubjects,
+        registeredAt: existing?.registeredAt || timestamp,
+        approvedAt: existing?.approvedAt || timestamp,
+        approvedBy: existing?.approvedBy || 'Auto-Import CSV'
+      };
+
+      if (existing && existing.id !== lecturerId) {
+        lecturersById.delete(existing.id);
+      }
+      lecturersById.set(lecturerId, updatedLecturer);
+      newlyProcessedLecturers.push(updatedLecturer);
+    }
+
+    // Apply to in-memory state (deduplicated by ID)
+    this.lecturers = Array.from(lecturersById.values());
+    this.subjects = Array.from(updatedSubjectsMap.values());
+    this.teachingAssignments = Array.from(assignmentsMap.values());
+
+    // Save locally
+    this.saveLecturersLocally();
+    this.saveSubjectsLocally();
+    this.saveTeachingAssignmentsLocally();
+
+    // Batch update Firestore
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        newlyProcessedLecturers.forEach((lec) => {
+          batch.set(doc(db, 'lecturers', lec.id), sanitizeForFirestore(lec), { merge: true });
+        });
+        this.subjects.forEach((sub) => {
+          batch.set(doc(db, 'subjects', sub.id), sanitizeForFirestore(sub), { merge: true });
+        });
+        this.teachingAssignments.forEach((ta) => {
+          batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
+        });
+        
+        // Fast background commit with timeout safeguard so UI never stalls
+        const commitPromise = batch.commit().catch((err) => {
+          console.warn('Background Firestore lecturer CSV import sync notice:', err?.message || err);
+        });
+        const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 1500));
+        await Promise.race([commitPromise, timeoutPromise]);
+      } catch (err) {
+        console.warn('Firestore lecturer CSV import sync warning:', err);
+      }
+    }
+
+    this.notifyLecturerListeners();
+    this.notifySubjectListeners();
+    this.notifyTeachingAssignmentListeners();
+
+    return {
+      success: true,
+      message: `Berjaya mengimport ${newLecturersList.length} pensyarah. Subjek dan kelas telah ditetapkan secara automatik ke dalam akaun masing-masing.`,
+      lecturers: this.lecturers,
+      subjects: this.subjects,
+      assignments: this.teachingAssignments
+    };
+  }
+
+  /**
+   * Update a lecturer's password (PIN).
+   * Validates that newPin is exactly 4 numeric digits and not '1234'.
+   * Clears mustChangePin flag and sets pinChangedAt timestamp.
+   */
+  public async updateLecturerPassword(
+    lecturerId: string,
+    newPin: string
+  ): Promise<{ success: boolean; message: string; lecturer?: Lecturer }> {
+    const cleanPin = newPin.trim();
+    if (!/^\d{4}$/.test(cleanPin)) {
+      return {
+        success: false,
+        message: 'Kata laluan mestilah tepat 4 digit numerik.'
+      };
+    }
+
+    if (cleanPin === DEFAULT_LECTURER_PIN) {
+      return {
+        success: false,
+        message: "Kata laluan baharu tidak boleh menggunakan kata laluan lalai '1234'. Sila pilih kombinasi 4 digit lain."
+      };
+    }
+
+    const lecturer = this.lecturers.find((l) => l.id === lecturerId);
+    if (!lecturer) {
+      return {
+        success: false,
+        message: 'Pensyarah tidak dijumpai.'
+      };
+    }
+
+    lecturer.pin = cleanPin;
+    lecturer.mustChangePin = false;
+    lecturer.pinChangedAt = new Date().toISOString();
+
+    if (this.activeLecturer && this.activeLecturer.id === lecturerId) {
+      this.activeLecturer = { ...lecturer };
+      this.saveActiveLecturerLocally();
+    }
+
+    this.saveLecturersLocally();
+    this.notifyLecturerListeners();
+
+    if (db) {
+      try {
+        await setDoc(doc(db, 'lecturers', lecturer.id), sanitizeForFirestore(lecturer), { merge: true });
+      } catch (e) {
+        console.warn('Failed to sync updated lecturer PIN to Firestore:', e);
+      }
+    }
+
+    return {
+      success: true,
+      message: 'Kata laluan berjaya dikemas kini!',
+      lecturer
+    };
+  }
+
+  /**
+   * Reset a lecturer's password back to default '1234' with mustChangePin = true.
+   * Admin-only capability.
+   */
+  public async resetLecturerPinToDefault(
+    lecturerId: string,
+    performedBy = 'Pentadbir Sistem'
+  ): Promise<{ success: boolean; message: string; lecturer?: Lecturer }> {
+    const lecturer = this.lecturers.find((l) => l.id === lecturerId);
+    if (!lecturer) {
+      return {
+        success: false,
+        message: 'Pensyarah tidak dijumpai.'
+      };
+    }
+
+    lecturer.pin = DEFAULT_LECTURER_PIN;
+    lecturer.mustChangePin = true;
+    delete lecturer.pinChangedAt;
+
+    if (this.activeLecturer && this.activeLecturer.id === lecturerId) {
+      this.activeLecturer = { ...lecturer };
+      this.saveActiveLecturerLocally();
+    }
+
+    this.saveLecturersLocally();
+    this.notifyLecturerListeners();
+
+    if (db) {
+      try {
+        await setDoc(doc(db, 'lecturers', lecturer.id), sanitizeForFirestore(lecturer), { merge: true });
+      } catch (e) {
+        console.warn('Failed to sync reset lecturer PIN to Firestore:', e);
+      }
+    }
+
+    return {
+      success: true,
+      message: `Kata laluan untuk ${lecturer.name} telah berjaya ditetapkan semula kepada ${DEFAULT_LECTURER_PIN}.`,
+      lecturer
+    };
+  }
+
+  public saveLecturersList(lecturers: Lecturer[]) {
+    this.lecturers = lecturers;
+    this.saveLecturersLocally();
+
+    if (db && lecturers.length > 0) {
+      try {
+        const batch = writeBatch(db);
+        lecturers.forEach((lecturer) => {
+          batch.set(doc(db, 'lecturers', lecturer.id), sanitizeForFirestore(lecturer), { merge: true });
+        });
+        batch.commit().catch((err) => {
+          console.warn('Error batch-saving lecturers to Firestore:', err?.message || err);
+        });
+      } catch (err) {
+        console.warn('Batch lecturers write notice:', err);
+      }
+    }
+  }
+
+  public saveSubjectsList(newSubjects: Subject[], replaceAll: boolean = true) {
+    if (replaceAll) {
+      this.subjects = newSubjects;
+    } else {
+      const existingMap = new Map<string, Subject>(this.subjects.map((s) => [(s.code || s.id).toUpperCase(), s]));
+      newSubjects.forEach((s) => existingMap.set((s.code || s.id).toUpperCase(), s));
+      this.subjects = Array.from(existingMap.values());
+    }
+    this.saveSubjectsLocally();
+
+    if (db && this.subjects.length > 0) {
+      try {
+        const batch = writeBatch(db);
+        this.subjects.forEach((subject) => {
+          batch.set(doc(db, 'subjects', subject.id), sanitizeForFirestore(subject), { merge: true });
+        });
+        batch.commit().catch((err) => {
+          console.warn('Error batch-saving subjects to Firestore:', err?.message || err);
+        });
+      } catch (err) {
+        console.warn('Batch subjects write notice:', err);
+      }
+    }
+  }
+
+  public saveSubject(subject: Subject) {
+    const existingIdx = this.subjects.findIndex((s) => s.id === subject.id || s.code === subject.code);
+    if (existingIdx >= 0) {
+      this.subjects[existingIdx] = subject;
+    } else {
+      this.subjects.push(subject);
+    }
+    this.saveSubjectsLocally();
+
+    if (db) {
+      setDoc(doc(db, 'subjects', subject.id), sanitizeForFirestore(subject), { merge: true }).catch(console.warn);
+    }
+  }
+
+  public addSubject(subject: Subject) {
+    this.saveSubject(subject);
+  }
+
+  public deleteSubject(subjectId: string) {
+    this.subjects = this.subjects.filter((s) => s.id !== subjectId);
+    this.saveSubjectsLocally();
+
+    if (db) {
+      deleteDoc(doc(db, 'subjects', subjectId)).catch(console.warn);
+    }
+  }
+
+  public resetSubjectsToDefault() {
+    this.subjects = [...INITIAL_SUBJECTS];
+    this.saveSubjectsLocally();
+
+    if (db) {
+      try {
+        const batch = writeBatch(db);
+        INITIAL_SUBJECTS.forEach((sub) => {
+          batch.set(doc(db, 'subjects', sub.id), sanitizeForFirestore(sub), { merge: true });
+        });
+        batch.commit().catch(console.warn);
+      } catch (e) {
+        console.warn('Reset subjects batch error:', e);
+      }
+    }
+  }
+
+  public deleteLecturer(lecturerId: string) {
+    this.lecturers = this.lecturers.filter((l) => l.id !== lecturerId);
+    this.saveLecturersLocally();
+
+    if (db) {
+      deleteDoc(doc(db, 'lecturers', lecturerId)).catch(console.warn);
+    }
+  }
+
+  public getActiveLecturer(): Lecturer | null {
+    return this.activeLecturer;
+  }
+
+  public setActiveLecturer(lecturer: Lecturer | null) {
+    this.activeLecturer = lecturer;
+    this.saveActiveLecturerLocally();
+  }
+
+  public logoutLecturer() {
+    this.activeLecturer = null;
+    this.saveActiveLecturerLocally();
+  }
+
+  // --- Getters ---
+  public getStudents(): Student[] {
+    return [...this.students];
+  }
+
+  public getLecturers(): Lecturer[] {
+    return [...this.lecturers];
+  }
+
+  public getSubjects(): Subject[] {
+    return [...this.subjects];
+  }
+
+  public getSessions(): AttendanceSession[] {
+    return sortSessionsLatestFirst(this.sessions);
+  }
+
+  public getAttendanceRecords(): AttendanceRecord[] {
+    return [...this.attendanceRecords];
+  }
+
+  public getActiveSession(): AttendanceSession | null {
+    return this.sessions.find((s) => s.status === 'OPEN') || null;
+  }
+
+  public getEnrollments(): Enrollment[] {
+    return [...this.enrollments];
+  }
+
+  public getEnrollmentsForStudent(studentId: string): Enrollment[] {
+    const cleanId = studentId.trim().toUpperCase();
+    return this.enrollments.filter(
+      (e) => e.studentId.toUpperCase() === cleanId && e.status !== 'DROPPED'
+    );
+  }
+
+  public getEnrollmentsForSubjectClass(subjectCode: string, className?: string): Enrollment[] {
+    const cleanSub = (subjectCode || '').trim().toUpperCase();
+    const normClass = className && className !== 'ALL' && className !== 'SEMUA' ? normalizeClassCode(className) : null;
+    return this.enrollments.filter((e) => {
+      const matchSub = (e.subjectCode || '').trim().toUpperCase() === cleanSub;
+      const matchClass = !normClass || normalizeClassCode(e.className) === normClass;
+      const isActive = e.status === 'ACTIVE' || (!e.status && e.status !== 'DROPPED');
+      return matchSub && matchClass && isActive;
+    });
+  }
+
+  public getEnrollmentsForLecturer(lecturerEmailOrName: string): Enrollment[] {
+    const term = lecturerEmailOrName.trim().toUpperCase();
+    return this.enrollments.filter(
+      (e) =>
+        (e.lecturerEmail?.toUpperCase() === term || e.lecturerName?.toUpperCase().includes(term)) &&
+        e.status !== 'DROPPED'
+    );
+  }
+
+  public getStudentsForSubjectClass(subjectCode: string, className?: string): Student[] {
+    const enrollments = this.getEnrollmentsForSubjectClass(subjectCode, className);
+    if (enrollments.length > 0) {
+      const studentIds = new Set(enrollments.map((e) => (e.studentId || '').trim().toUpperCase()));
+      const enrolled = this.students.filter((s) => {
+        const sId = (s.studentId || '').trim().toUpperCase();
+        const id = (s.id || '').trim().toUpperCase();
+        return studentIds.has(sId) || studentIds.has(id);
+      });
+      if (enrolled.length > 0) {
+        return enrolled;
+      }
+    }
+    
+    // Fallback: If no individual subject enrollments exist yet, return all students belonging to this class
+    if (className && className !== 'ALL' && className !== 'SEMUA') {
+      return this.students.filter((s) => areClassesMatching(s.className, className));
+    }
+
+    return this.students;
+  }
+
+  public getAvailableClasses(): string[] {
+    const classSet = new Set<string>();
+    this.students.forEach((s) => {
+      if (s.className) classSet.add(s.className);
+    });
+    this.enrollments.forEach((e) => {
+      if (e.className) classSet.add(e.className);
+    });
+    // Default fallback
+    if (classSet.size === 0) {
+      return ['DIA_4A', 'DIA_4B', 'DIA_4C', 'DIA_4D'];
+    }
+    return Array.from(classSet).sort();
+  }
+
+  public getStudentById(studentId: string): Student | undefined {
+    if (!studentId) return undefined;
+    const standardId = normalizeStudentId(studentId);
+    const strippedId = stripStudentId(studentId);
+    const cleanId = studentId.trim().toUpperCase();
+
+    return this.students.find((s) => {
+      const sStandard = normalizeStudentId(s.studentId || s.id);
+      const sPrimaryStandard = normalizeStudentId(s.id);
+      const sStripped = stripStudentId(s.studentId || s.id);
+      const sPrimaryStripped = stripStudentId(s.id);
+
+      return (
+        sStandard === standardId ||
+        sPrimaryStandard === standardId ||
+        sStripped === strippedId ||
+        sPrimaryStripped === strippedId ||
+        s.id.toUpperCase() === standardId ||
+        s.studentId.toUpperCase() === standardId ||
+        s.id.toUpperCase() === cleanId ||
+        s.studentId.toUpperCase() === cleanId ||
+        (cleanId.length >= 6 && s.phone.includes(cleanId)) ||
+        s.email.toUpperCase() === cleanId
+      );
+    });
+  }
+
+  // --- Student Master & Enrollment Registration Engine ---
+  public async registerStudentEnrollment(params: {
+    studentId: string;
+    name: string;
+    email?: string;
+    phone?: string;
+    className: string;
+    department?: string;
+    subjectCode: string;
+    subjectName?: string;
+    lecturerName?: string;
+    lecturerEmail?: string;
+    section?: string;
+  }): Promise<{
+    success: boolean;
+    isNewStudent: boolean;
+    isNewEnrollment: boolean;
+    student: Student;
+    enrollment: Enrollment;
+    message: string;
+  }> {
+    const rawStudentId = normalizeStudentId(params.studentId || '');
+    const rawName = (params.name || '').trim().toUpperCase();
+    const rawClassName = (params.className || '').trim().toUpperCase().replace(/\s+/g, '_');
+    const rawSubCode = (params.subjectCode || '').trim().toUpperCase();
+    const rawSubName = (params.subjectName || '').trim();
+    const rawEmail = (params.email || '').trim().toLowerCase();
+    const rawPhone = (params.phone || '').trim();
+    const rawDept = (params.department || '').trim() || 'Diploma Perakaunan';
+
+    if (!rawStudentId) {
+      throw new Error('No. Pelajar (Student ID) diperlukan.');
+    }
+    if (!rawName) {
+      throw new Error('Nama Pelajar diperlukan.');
+    }
+    if (!rawSubCode) {
+      throw new Error('Kod Subjek diperlukan.');
+    }
+    if (!rawClassName) {
+      throw new Error('Kelas / Seksyen diperlukan.');
+    }
+
+    // 1. Search existing Student Master by normalized studentId / id
+    const existingStudent = this.students.find(
+      (s) =>
+        normalizeStudentId(s.studentId) === rawStudentId ||
+        normalizeStudentId(s.id) === rawStudentId ||
+        stripStudentId(s.studentId) === stripStudentId(rawStudentId) ||
+        stripStudentId(s.id) === stripStudentId(rawStudentId)
+    );
+
+    let studentRecord: Student;
+    let isNewStudent = false;
+
+    if (!existingStudent) {
+      isNewStudent = true;
+      studentRecord = {
+        id: rawStudentId,
+        studentId: rawStudentId,
+        name: rawName,
+        className: rawClassName,
+        email: rawEmail || `${rawStudentId.toLowerCase().replace(/[^a-z0-9]/g, '')}@bpenawar.kpm.edu.my`,
+        phone: rawPhone || '',
+        department: rawDept
+      };
+      this.students = [studentRecord, ...this.students.filter((s) => s.id !== rawStudentId)];
+      this.saveStudentsLocally();
+      if (db) {
+        setDoc(doc(db, 'students', rawStudentId), sanitizeForFirestore(studentRecord), { merge: true }).catch(console.warn);
+      }
+    } else {
+      isNewStudent = false;
+      // Do not duplicate or overwrite core identity; update non-conflicting empty contact fields if provided
+      let hasUpdates = false;
+      const updatedStudent: Student = { ...existingStudent };
+      if (!updatedStudent.phone && rawPhone) {
+        updatedStudent.phone = rawPhone;
+        hasUpdates = true;
+      }
+      if (!updatedStudent.email && rawEmail) {
+        updatedStudent.email = rawEmail;
+        hasUpdates = true;
+      }
+      if (hasUpdates) {
+        studentRecord = updatedStudent;
+        this.students = this.students.map((s) => (s.id === existingStudent.id ? updatedStudent : s));
+        this.saveStudentsLocally();
+        if (db) {
+          setDoc(doc(db, 'students', updatedStudent.id), sanitizeForFirestore(updatedStudent), { merge: true }).catch(console.warn);
+        }
+      } else {
+        studentRecord = existingStudent;
+      }
+    }
+
+    // 2. Create / Update Enrollment
+    const cleanSubCodeKey = rawSubCode.replace(/[^A-Z0-9]/g, '');
+    const cleanClassKey = rawClassName.replace(/[^A-Z0-9]/g, '');
+    const cleanStudentKey = rawStudentId.replace(/[^A-Z0-9]/g, '');
+    const enrollmentId = `ENR_${cleanStudentKey}_${cleanSubCodeKey}_${cleanClassKey}`;
+
+    const existingEnrollmentIndex = this.enrollments.findIndex(
+      (e) =>
+        e.id === enrollmentId ||
+        (e.studentId.toUpperCase() === rawStudentId &&
+          e.subjectCode.toUpperCase() === rawSubCode &&
+          e.className.toUpperCase() === rawClassName)
+    );
+
+    let enrollmentRecord: Enrollment;
+    let isNewEnrollment = false;
+
+    if (existingEnrollmentIndex >= 0) {
+      isNewEnrollment = false;
+      enrollmentRecord = {
+        ...this.enrollments[existingEnrollmentIndex],
+        status: 'ACTIVE',
+        subjectName: rawSubName || this.enrollments[existingEnrollmentIndex].subjectName,
+        lecturerName: params.lecturerName || this.enrollments[existingEnrollmentIndex].lecturerName,
+        lecturerEmail: params.lecturerEmail || this.enrollments[existingEnrollmentIndex].lecturerEmail
+      };
+      this.enrollments[existingEnrollmentIndex] = enrollmentRecord;
+    } else {
+      isNewEnrollment = true;
+      enrollmentRecord = {
+        id: enrollmentId,
+        studentId: rawStudentId,
+        subjectCode: rawSubCode,
+        subjectName: rawSubName,
+        className: rawClassName,
+        section: params.section || rawClassName,
+        lecturerEmail: params.lecturerEmail || '',
+        lecturerName: params.lecturerName || '',
+        enrolledAt: new Date().toISOString(),
+        status: 'ACTIVE'
+      };
+      this.enrollments = [enrollmentRecord, ...this.enrollments];
+    }
+
+    this.saveEnrollmentsLocally();
+    if (db) {
+      await setDoc(doc(db, 'enrollments', enrollmentRecord.id), sanitizeForFirestore(enrollmentRecord), { merge: true }).catch(console.warn);
+    }
+
+    return {
+      success: true,
+      isNewStudent,
+      isNewEnrollment,
+      student: studentRecord,
+      enrollment: enrollmentRecord,
+      message: isNewEnrollment
+        ? `Pendaftaran berjaya! Pelajar ${studentRecord.name} telah didaftarkan ke dalam subjek ${rawSubCode} (${rawClassName}).`
+        : `Maklumat pendaftaran disahkan untuk ${studentRecord.name} dalam subjek ${rawSubCode}.`
+    };
+  }
+
+  public async deleteEnrollment(enrollmentId: string) {
+    this.enrollments = this.enrollments.filter((e) => e.id !== enrollmentId);
+    this.saveEnrollmentsLocally();
+    if (db) {
+      await deleteDoc(doc(db, 'enrollments', enrollmentId)).catch(console.warn);
+    }
+  }
+
+  /**
+   * Returns all unique normalized class names from students, subjects, lecturers and assignments
+   */
+  public getUniqueClasses(): string[] {
+    const classSet = new Set<string>();
+    this.students.forEach((s) => {
+      if (s.className) classSet.add(s.className.trim().toUpperCase());
+      if (s.classId) classSet.add(s.classId.trim().toUpperCase());
+    });
+    this.subjects.forEach((sub) => {
+      (sub.sections || []).forEach((sec) => classSet.add(sec.trim().toUpperCase()));
+    });
+    this.lecturers.forEach((lec) => {
+      (lec.assignedClasses || lec.assignedSections || []).forEach((c) =>
+        classSet.add(c.trim().toUpperCase())
+      );
+    });
+    this.teachingAssignments.forEach((ta) => {
+      if (ta.className) classSet.add(ta.className.trim().toUpperCase());
+    });
+    return Array.from(classSet).filter(Boolean).sort();
+  }
+
+  /**
+   * Batch enroll students from master roster into a subject based on their class.
+   * Enables 1-click sync between master student records (83 students) and subject enrollment.
+   * Optimized with instant local cache commitment and fast writeBatch Firestore syncing.
+   */
+  public async batchEnrollStudentsForSubject(params: {
+    subjectCode: string;
+    subjectName: string;
+    classNames?: string[];
+    lecturerName?: string;
+    lecturerEmail?: string;
+  }): Promise<{ count: number; message: string }> {
+    const rawSubCode = (params.subjectCode || '').trim().toUpperCase();
+    const rawSubName = (params.subjectName || '').trim();
+    const targetClasses = (params.classNames || []).map((c) => c.trim().toUpperCase());
+
+    // Filter students from master list
+    const candidateStudents = this.students.filter((s) => {
+      if (!s.className) return false;
+      const sClass = s.className.trim().toUpperCase();
+      if (targetClasses.length === 0 || targetClasses.includes('ALL')) return true;
+      return targetClasses.some((tc) => tc === sClass || tc.replace(/_/g, ' ') === sClass.replace(/_/g, ' '));
+    });
+
+    if (candidateStudents.length === 0) {
+      return {
+        count: 0,
+        message: 'Tiada rekod pelajar induk dijumpai bagi kelas yang dipilih.'
+      };
+    }
+
+    const now = new Date().toISOString();
+    const recordsToSave: Enrollment[] = [];
+
+    for (const student of candidateStudents) {
+      const rawStudentId = (student.studentId || student.id).trim().toUpperCase();
+      const rawClassName = (student.className || 'DIA_4A').trim().toUpperCase();
+      const cleanSubCodeKey = rawSubCode.replace(/[^A-Z0-9]/g, '');
+      const cleanClassKey = rawClassName.replace(/[^A-Z0-9]/g, '');
+      const cleanStudentKey = rawStudentId.replace(/[^A-Z0-9]/g, '');
+      const enrollmentId = `ENR_${cleanStudentKey}_${cleanSubCodeKey}_${cleanClassKey}`;
+
+      const existingIndex = this.enrollments.findIndex(
+        (e) =>
+          e.id === enrollmentId ||
+          (e.studentId.toUpperCase() === rawStudentId &&
+            e.subjectCode.toUpperCase() === rawSubCode &&
+            e.className.toUpperCase() === rawClassName)
+      );
+
+      const record: Enrollment = {
+        id: enrollmentId,
+        studentId: rawStudentId,
+        subjectCode: rawSubCode,
+        subjectName: rawSubName,
+        className: rawClassName,
+        section: rawClassName,
+        lecturerEmail: params.lecturerEmail || '',
+        lecturerName: params.lecturerName || '',
+        enrolledAt: existingIndex >= 0 ? this.enrollments[existingIndex].enrolledAt : now,
+        status: 'ACTIVE'
+      };
+
+      if (existingIndex >= 0) {
+        this.enrollments[existingIndex] = record;
+      } else {
+        this.enrollments = [record, ...this.enrollments];
+      }
+      recordsToSave.push(record);
+    }
+
+    // 1. Instantly commit to local cache and notify all UI listeners (0ms perceived latency)
+    this.saveEnrollmentsLocally();
+    this.notifyEnrollmentListeners();
+
+    // 2. Perform fast non-blocking Firestore writeBatch in chunks of 400 with a timeout safeguard
+    if (db && recordsToSave.length > 0) {
+      try {
+        const batchPromise = (async () => {
+          for (let i = 0; i < recordsToSave.length; i += 400) {
+            const batch = writeBatch(db!);
+            const chunk = recordsToSave.slice(i, i + 400);
+            chunk.forEach((rec) => {
+              batch.set(doc(db!, 'enrollments', rec.id), sanitizeForFirestore(rec), { merge: true });
+            });
+            await batch.commit();
+          }
+        })();
+
+        // Race with a 2.5 second timeout safeguard so UI never stalls if network or cloud is slow
+        const timeoutPromise = new Promise((resolve) => setTimeout(resolve, 2500));
+        await Promise.race([batchPromise, timeoutPromise]);
+      } catch (err) {
+        console.warn('Firestore batch enrollment sync warning (local cache retained):', err);
+      }
+    }
+
+    return {
+      count: candidateStudents.length,
+      message: `Berjaya menyelaraskan & mendaftarkan ${candidateStudents.length} pelajar induk ke dalam subjek ${rawSubCode}.`
+    };
+  }
+
+  // --- Mutation Methods ---
+  public async saveStudentsList(students: Student[], replaceAll: boolean = true) {
+    // Deduplicate by clean ID so each student has exactly 1 record and 1 QR code
+    const dedupedMap = new Map<string, Student>();
+    students.forEach((s, idx) => {
+      const rawId = (s.studentId || s.id || `PDA-ST-${idx + 1}`).trim().toUpperCase();
+      if (!dedupedMap.has(rawId)) {
+        dedupedMap.set(rawId, {
+          ...s,
+          id: rawId,
+          studentId: rawId,
+          name: (s.name || `PELAJAR ${idx + 1}`).trim().toUpperCase(),
+          className: (s.className || 'DIA_4A').trim().toUpperCase().replace(/\s+/g, '_')
+        });
+      }
+    });
+
+    const cleanStudents = Array.from(dedupedMap.values());
+    this.students = cleanStudents;
+    this.saveStudentsLocally();
+
+    if (db) {
+      try {
+        if (replaceAll) {
+          // 1. Fetch all currently existing student documents in Firestore and delete those not in new set
+          const snapshot = await getDocs(collection(db, 'students'));
+          const newIds = new Set(cleanStudents.map((s) => s.id));
+          const toDelete = snapshot.docs.filter((docSnap) => !newIds.has(docSnap.id));
+
+          // Batch delete in chunks of 400
+          for (let i = 0; i < toDelete.length; i += 400) {
+            const batch = writeBatch(db);
+            const chunk = toDelete.slice(i, i + 400);
+            chunk.forEach((docSnap) => {
+              batch.delete(doc(db!, 'students', docSnap.id));
+            });
+            await batch.commit();
+          }
+        }
+
+        // 2. Write/Upsert current students in chunks of 400
+        for (let i = 0; i < cleanStudents.length; i += 400) {
+          const batch = writeBatch(db);
+          const chunk = cleanStudents.slice(i, i + 400);
+          chunk.forEach((student) => {
+            batch.set(doc(db!, 'students', student.id), sanitizeForFirestore(student), { merge: true });
+          });
+          await batch.commit();
+        }
+      } catch (err) {
+        console.warn('Firestore students save/replace error:', err);
+      }
+    }
+  }
+
+  /**
+   * Admin Utility: Automatically detect and clean any redundant or duplicate student entries
+   */
+  public async cleanupRedundantStudents(): Promise<{ removedCount: number; finalCount: number }> {
+    const originalCount = this.students.length;
+    const dedupedMap = new Map<string, Student>();
+
+    // Deduplicate in-memory by studentId
+    this.students.forEach((s, idx) => {
+      const rawId = (s.studentId || s.id || `PDA-ST-${idx + 1}`).trim().toUpperCase();
+      if (!dedupedMap.has(rawId)) {
+        dedupedMap.set(rawId, {
+          ...s,
+          id: rawId,
+          studentId: rawId,
+          name: (s.name || `PELAJAR ${idx + 1}`).trim().toUpperCase(),
+          className: (s.className || 'DIA_4A').trim().toUpperCase().replace(/\s+/g, '_')
+        });
+      }
+    });
+
+    const cleanStudents = Array.from(dedupedMap.values());
+    this.students = cleanStudents;
+    this.saveStudentsLocally();
+
+    let removedFromDb = 0;
+    if (db) {
+      try {
+        const snapshot = await getDocs(collection(db, 'students'));
+        const validIds = new Set(cleanStudents.map((s) => s.id));
+        const toDelete = snapshot.docs.filter((docSnap) => !validIds.has(docSnap.id));
+
+        for (let i = 0; i < toDelete.length; i += 400) {
+          const batch = writeBatch(db);
+          const chunk = toDelete.slice(i, i + 400);
+          chunk.forEach((docSnap) => {
+            batch.delete(doc(db!, 'students', docSnap.id));
+            removedFromDb++;
+          });
+          await batch.commit();
+        }
+      } catch (err) {
+        console.warn('Cleanup Firestore error:', err);
+      }
+    }
+
+    return {
+      removedCount: Math.max(originalCount - cleanStudents.length, removedFromDb),
+      finalCount: cleanStudents.length
+    };
+  }
+
+  public addStudent(student: Student) {
+    this.students = [student, ...this.students.filter((s) => s.id !== student.id)];
+    this.saveStudentsLocally();
+
+    if (db) {
+      setDoc(doc(db, 'students', student.id), sanitizeForFirestore(student), { merge: true }).catch(console.warn);
+    }
+  }
+
+  public deleteStudent(studentId: string) {
+    this.students = this.students.filter((s) => s.id !== studentId && s.studentId !== studentId);
+    this.saveStudentsLocally();
+
+    if (db) {
+      deleteDoc(doc(db, 'students', studentId)).catch(console.warn);
+    }
+  }
+
+  public updateStudent(updatedStudent: Student) {
+    this.students = this.students.map((s) => (s.id === updatedStudent.id || s.studentId === updatedStudent.studentId ? updatedStudent : s));
+    this.saveStudentsLocally();
+
+    if (db) {
+      setDoc(doc(db, 'students', updatedStudent.id), sanitizeForFirestore(updatedStudent), { merge: true }).catch(console.warn);
+    }
+  }
+
+  public setStudentAttendanceRecord(params: {
+    sessionId: string;
+    studentId: string;
+    status: 'PRESENT' | 'ABSENT' | 'LATE' | 'EXCUSED' | 'REMOVE';
+    notes?: string;
+  }) {
+    const { sessionId, studentId, status, notes } = params;
+    const standardStudentId = normalizeStudentId(studentId);
+    const student = this.getStudentById(studentId) || this.students.find(
+      (s) => normalizeStudentId(s.studentId) === standardStudentId || normalizeStudentId(s.id) === standardStudentId
+    );
+    const resolvedStudentId = student?.studentId || student?.id || standardStudentId;
+
+    const existing = this.attendanceRecords.find(
+      (r) =>
+        r.sessionId === sessionId &&
+        (r.studentId === resolvedStudentId ||
+          normalizeStudentId(r.studentId) === standardStudentId ||
+          (student && r.studentId === student.id))
+    );
+
+    if (status === 'REMOVE') {
+      if (existing) {
+        this.attendanceRecords = this.attendanceRecords.filter((r) => r.id !== existing.id);
+        this.saveRecordsLocally();
+        if (db) {
+          deleteDoc(doc(db, 'attendance_records', existing.id)).catch(console.warn);
+        }
+      }
+      return;
+    }
+
+    const session = this.sessions.find((s) => s.id === sessionId);
+
+    if (existing) {
+      const updated: AttendanceRecord = {
+        ...existing,
+        status,
+        notes: notes !== undefined ? notes : existing.notes,
+        timestamp: existing.timestamp || new Date().toISOString()
+      };
+      this.attendanceRecords = this.attendanceRecords.map((r) => (r.id === existing.id ? updated : r));
+      this.saveRecordsLocally();
+      if (db) {
+        setDoc(doc(db, 'attendance_records', updated.id), sanitizeForFirestore(updated), { merge: true }).catch(console.warn);
+      }
+    } else {
+      const newRecord: AttendanceRecord = {
+        id: `REC_MANUAL_${sessionId}_${resolvedStudentId}_${Date.now()}`,
+        sessionId,
+        subjectCode: session?.subjectCode || '',
+        className: student?.className || session?.className || '',
+        studentId: resolvedStudentId,
+        studentName: student?.name || resolvedStudentId,
+        timestamp: new Date().toISOString(),
+        method: 'MANUAL',
+        status,
+        notes: notes || 'Pelarasan manual guru/pensyarah'
+      };
+      this.attendanceRecords = [newRecord, ...this.attendanceRecords];
+      this.saveRecordsLocally();
+      if (db) {
+        setDoc(doc(db, 'attendance_records', newRecord.id), sanitizeForFirestore(newRecord), { merge: true }).catch(console.warn);
+      }
+    }
+  }
+
+  /**
+   * Remove a specific section/class from a subject's configured sections
+   */
+  public removeSectionFromSubject(subjectId: string, className: string, fallbackSectionsIfEmpty?: string[]) {
+    const norm = className.trim().toUpperCase();
+    this.subjects = this.subjects.map((sub) => {
+      if (sub.id === subjectId || sub.code.toUpperCase() === subjectId.toUpperCase()) {
+        const baseSections = (sub.sections && sub.sections.length > 0)
+          ? sub.sections
+          : (fallbackSectionsIfEmpty && fallbackSectionsIfEmpty.length > 0 ? fallbackSectionsIfEmpty : ['DIA_4A', 'DIA_4B', 'DIA_4C', 'DIA_4D']);
+        const updated = {
+          ...sub,
+          sections: baseSections.filter((s) => s.trim().toUpperCase() !== norm)
+        };
+        if (db) {
+          setDoc(doc(db, 'subjects', updated.id), sanitizeForFirestore(updated), { merge: true }).catch(console.warn);
+        }
+        return updated;
+      }
+      return sub;
+    });
+    this.saveSubjectsLocally();
+    this.notifySubjectListeners();
+    this.broadcastChange();
+  }
+
+  /**
+   * Delete an accidental or unwanted class entirely from the system:
+   * - Removes class from all subjects' sections
+   * - Removes class from all lecturers' assignedClasses & assignedSections
+   * - Removes related teaching assignments
+   * - Clears/removes students under this class
+   * - Syncs to Firestore & localStorage
+   */
+  public deleteClass(className: string, options?: { deleteStudents?: boolean }) {
+    const norm = className.trim().toUpperCase();
+
+    // 1. Remove from all subjects
+    this.subjects = this.subjects.map((sub) => {
+      const existing = sub.sections || [];
+      if (existing.some((s) => s.trim().toUpperCase() === norm)) {
+        const updated = {
+          ...sub,
+          sections: existing.filter((s) => s.trim().toUpperCase() !== norm)
+        };
+        if (db) {
+          setDoc(doc(db, 'subjects', updated.id), sanitizeForFirestore(updated), { merge: true }).catch(console.warn);
+        }
+        return updated;
+      }
+      return sub;
+    });
+    this.saveSubjectsLocally();
+
+    // 2. Remove from lecturers
+    this.lecturers = this.lecturers.map((lec) => {
+      const secList = [...(lec.assignedClasses || []), ...(lec.assignedSections || [])];
+      if (secList.some((c) => c.trim().toUpperCase() === norm)) {
+        const updated = {
+          ...lec,
+          assignedClasses: (lec.assignedClasses || []).filter((c) => c.trim().toUpperCase() !== norm),
+          assignedSections: (lec.assignedSections || []).filter((c) => c.trim().toUpperCase() !== norm)
+        };
+        if (db) {
+          setDoc(doc(db, 'lecturers', updated.id), sanitizeForFirestore(updated), { merge: true }).catch(console.warn);
+        }
+        return updated;
+      }
+      return lec;
+    });
+    this.saveLecturersLocally();
+
+    // 3. Remove from teaching assignments
+    const toRemoveAssignments = this.teachingAssignments.filter(
+      (ta) => ta.className && ta.className.trim().toUpperCase() === norm
+    );
+    this.teachingAssignments = this.teachingAssignments.filter(
+      (ta) => !ta.className || ta.className.trim().toUpperCase() !== norm
+    );
+    this.saveTeachingAssignmentsLocally();
+    if (db) {
+      toRemoveAssignments.forEach((ta) => {
+        if (ta.id) deleteDoc(doc(db, 'teaching_assignments', ta.id)).catch(console.warn);
+      });
+    }
+
+    // 4. Enrollments
+    this.enrollments = this.enrollments.filter(
+      (enr) => !enr.className || enr.className.trim().toUpperCase() !== norm
+    );
+    this.saveEnrollmentsLocally();
+
+    // 5. Students
+    if (options?.deleteStudents) {
+      const studentsToDelete = this.students.filter(
+        (s) =>
+          (s.className && s.className.trim().toUpperCase() === norm) ||
+          (s.classId && s.classId.trim().toUpperCase() === norm)
+      );
+      this.students = this.students.filter(
+        (s) =>
+          (!s.className || s.className.trim().toUpperCase() !== norm) &&
+          (!s.classId || s.classId.trim().toUpperCase() !== norm)
+      );
+      this.saveStudentsLocally();
+      if (db) {
+        studentsToDelete.forEach((s) => {
+          deleteDoc(doc(db, 'students', s.id)).catch(console.warn);
+        });
+      }
+    } else {
+      // Clear their className & classId so the accidental class doesn't keep appearing
+      this.students = this.students.map((s) => {
+        const matchClass =
+          (s.className && s.className.trim().toUpperCase() === norm) ||
+          (s.classId && s.classId.trim().toUpperCase() === norm);
+        if (matchClass) {
+          const updated = {
+            ...s,
+            className: s.className?.trim().toUpperCase() === norm ? '' : s.className,
+            classId: s.classId?.trim().toUpperCase() === norm ? '' : s.classId
+          };
+          if (db) {
+            setDoc(doc(db, 'students', s.id), sanitizeForFirestore(updated), { merge: true }).catch(console.warn);
+          }
+          return updated;
+        }
+        return s;
+      });
+      this.saveStudentsLocally();
+    }
+
+    // 6. Notify all listeners
+    this.notifySubjectListeners();
+    this.notifyLecturerListeners();
+    this.notifyTeachingAssignmentListeners();
+    this.notifyStudentListeners();
+    this.notifyEnrollmentListeners();
+    this.broadcastChange();
+  }
+
+  public saveSubjects(subjects: Subject[]) {
+    this.subjects = subjects;
+    this.saveSubjectsLocally();
+
+    if (db && subjects.length > 0) {
+      try {
+        const batch = writeBatch(db);
+        subjects.forEach((subj) => {
+          batch.set(doc(db, 'subjects', subj.id), sanitizeForFirestore(subj), { merge: true });
+        });
+        batch.commit().catch(console.warn);
+      } catch (err) {
+        console.warn('Batch subjects write notice:', err);
+      }
+    }
+  }
+
+  public saveSessions(sessions: AttendanceSession[]) {
+    this.sessions = sessions;
+    this.saveSessionsLocally();
+
+    if (db && sessions.length > 0) {
+      try {
+        const batch = writeBatch(db);
+        sessions.forEach((session) => {
+          batch.set(doc(db, 'sessions', session.id), sanitizeForFirestore(session), { merge: true });
+        });
+        batch.commit().catch(console.warn);
+      } catch (err) {
+        console.warn('Batch sessions write notice:', err);
+      }
+    }
+  }
+
+  public addSession(session: AttendanceSession) {
+    let updated = [...this.sessions];
+
+    // Single Active Session Invariant (1 PENSYARAH = MAKSIMUM 1 SESI AKTIF PADA SATU MASA):
+    // If a new session is being added with status 'OPEN', any other active OPEN session for this lecturer is safely closed.
+    if (session.status === 'OPEN') {
+      const now = new Date();
+      const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+      const lecId = (session.lecturerId || '').trim();
+      const lecEmail = (session.lecturerEmail || '').trim().toLowerCase();
+
+      updated = updated.map((s) => {
+        if (s.id !== session.id && s.status === 'OPEN') {
+          const matchId = Boolean(lecId && s.lecturerId === lecId);
+          const matchEmail = Boolean(lecEmail && s.lecturerEmail && s.lecturerEmail.trim().toLowerCase() === lecEmail);
+          if (matchId || matchEmail) {
+            const closedOldSession: AttendanceSession = {
+              ...s,
+              status: 'CLOSED',
+              endTime: s.endTime && s.endTime.trim().length > 0 ? s.endTime : timeStr,
+              updatedAt: now.toISOString()
+            };
+            if (db) {
+              setDoc(doc(db, 'sessions', closedOldSession.id), sanitizeForFirestore(closedOldSession), { merge: true }).catch(console.warn);
+            }
+            return closedOldSession;
+          }
+        }
+        return s;
+      });
+    }
+
+    const index = updated.findIndex((s) => s.id === session.id);
+    if (index >= 0) {
+      updated[index] = session;
+    } else {
+      updated = [session, ...updated];
+    }
+
+    this.sessions = updated;
+    this.saveSessionsLocally();
+
+    if (db) {
+      setDoc(doc(db, 'sessions', session.id), sanitizeForFirestore(session), { merge: true }).catch(console.warn);
+    }
+
+    return updated;
+  }
+
+  public addMultipleSessions(newSessions: AttendanceSession[]): AttendanceSession[] {
+    if (!newSessions || newSessions.length === 0) return this.sessions;
+    let updated = [...this.sessions];
+
+    for (const s of newSessions) {
+      const index = updated.findIndex((item) => item.id === s.id);
+      if (index >= 0) {
+        updated[index] = s;
+      } else {
+        updated = [s, ...updated];
+      }
+    }
+
+    this.sessions = updated;
+    this.saveSessionsLocally();
+    this.notifySessionListeners();
+
+    if (db) {
+      newSessions.forEach((s) => {
+        setDoc(doc(db, 'sessions', s.id), sanitizeForFirestore(s), { merge: true }).catch(console.warn);
+      });
+    }
+
+    return updated;
+  }
+
+  public updateSession(session: AttendanceSession): AttendanceSession[] {
+    const existing = this.sessions.find((s) => s.id === session.id);
+    if (existing && existing.status === 'CLOSED' && session.status === 'OPEN') {
+      console.warn(`[SESSION SAFETY] Illegal transition blocked: CLOSED session ${session.id} cannot be reopened via updateSession.`);
+      session = { ...session, status: 'CLOSED', endTime: existing.endTime || session.endTime };
+    }
+    const updated = this.sessions.map((s) => (s.id === session.id ? { ...s, ...session } : s));
+    this.sessions = updated;
+    this.saveSessionsLocally();
+    this.notifySessionListeners();
+
+    if (db) {
+      setDoc(doc(db, 'sessions', session.id), sanitizeForFirestore(session), { merge: true }).catch(console.warn);
+    }
+
+    return updated;
+  }
+
+  public deleteSession(sessionId: string): AttendanceSession[] {
+    const updated = this.sessions.filter((s) => s.id !== sessionId);
+    this.sessions = updated;
+    this.saveSessionsLocally();
+
+    // Clean up any attendance records linked to this session
+    const deletedRecordIds = this.attendanceRecords.filter((r) => r.sessionId === sessionId).map((r) => r.id);
+    this.attendanceRecords = this.attendanceRecords.filter((r) => r.sessionId !== sessionId);
+    this.saveRecordsLocally();
+
+    if (db) {
+      deleteDoc(doc(db, 'sessions', sessionId)).catch(console.warn);
+      deletedRecordIds.forEach((recId) => {
+        deleteDoc(doc(db, 'attendanceRecords', recId)).catch(console.warn);
+      });
+    }
+
+    return updated;
+  }
+
+  public setSessionStatus(sessionId: string, newStatus: EventStatus): AttendanceSession[] {
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+    let targetUpdated: AttendanceSession | null = null;
+
+    const existingSession = this.sessions.find((s) => s.id === sessionId);
+    // SES v4.5 Lifecycle Safety: Block illegal transition CLOSED -> OPEN
+    if (existingSession && existingSession.status === 'CLOSED' && newStatus === 'OPEN') {
+      console.warn(`[SESSION SAFETY] Illegal transition blocked: Session ${sessionId} is CLOSED and cannot be transitioned back to OPEN.`);
+      return this.sessions;
+    }
+
+    const updated = this.sessions.map((session) => {
+      if (session.id === sessionId) {
+        const closedEndTime = session.endTime && session.endTime.trim().length > 0 ? session.endTime : timeStr;
+        targetUpdated = {
+          ...session,
+          status: newStatus,
+          endTime: newStatus === 'CLOSED' ? closedEndTime : session.endTime,
+          updatedAt: now.toISOString()
+        };
+        return targetUpdated;
+      }
+      return session;
+    });
+
+    this.sessions = updated;
+    this.saveSessionsLocally();
+
+    if (db && targetUpdated) {
+      setDoc(doc(db, 'sessions', (targetUpdated as AttendanceSession).id), sanitizeForFirestore(targetUpdated), { merge: true }).catch(console.warn);
+    }
+
+    return updated;
+  }
+
+  public findActiveSession(subjectCode: string, className: string, lecturerId?: string): AttendanceSession | undefined {
+    const normTargetClass = normalizeClassCode(className);
+    return this.sessions.find((s) => {
+      if (s.status !== 'OPEN') return false;
+      const isSubjMatch = s.subjectCode === subjectCode || s.subjectId === subjectCode;
+      const isClassMatch = normalizeClassCode(s.className) === normTargetClass;
+      const isLecMatch = !lecturerId || s.lecturerId === lecturerId;
+      return isSubjMatch && isClassMatch && isLecMatch;
+    });
+  }
+
+  public activateClassSession(
+    subject: Subject,
+    className: string,
+    lecturer: Lecturer,
+    teachingAssignmentId?: string
+  ): { session: AttendanceSession; isExisting: boolean; closedPreviousSession?: AttendanceSession; conflictingSession?: AttendanceSession } {
+    // 1. Check for existing OPEN session for the exact same subject and class (Duplicate Protection / Resume)
+    const existing = this.findActiveSession(subject.code, className, lecturer.id);
+    if (existing) {
+      return { session: existing, isExisting: true };
+    }
+
+    // 2. Identify previous OPEN session for this lecturer (Single Active Session Invariant: 1 Pensyarah = 1 Sesi Aktif)
+    const prevOpen = this.sessions.find(
+      (s) =>
+        s.status === 'OPEN' &&
+        (s.lecturerId === lecturer.id ||
+          (s.lecturerEmail && lecturer.email && s.lecturerEmail.toLowerCase() === lecturer.email.toLowerCase()))
+    );
+
+    // 3. Resolve active teachingAssignmentId
+    const resolvedTeachingAssignmentId =
+      teachingAssignmentId ||
+      this.teachingAssignments.find(
+        (ta) =>
+          ta.status === 'ACTIVE' &&
+          (ta.lecturerId === lecturer.id || (ta.lecturerEmail && lecturer.email && ta.lecturerEmail.toLowerCase() === lecturer.email.toLowerCase())) &&
+          ta.subjectCode.trim().toUpperCase() === subject.code.trim().toUpperCase() &&
+          normalizeClassCode(ta.className) === normalizeClassCode(className)
+      )?.id;
+
+    // 4. Determine authoritative target student count from ACTIVE enrollments or class cohort
+    const activeEnrollments = this.getEnrollmentsForSubjectClass(subject.code, className);
+    const classCohortStudents = this.students.filter((s) => areClassesMatching(s.className, className));
+    const targetCount = activeEnrollments.length > 0 ? activeEnrollments.length : classCohortStudents.length;
+
+    // 5. Current timestamp
+    const now = new Date();
+    const dateStr = now.toISOString().split('T')[0];
+    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
+
+    // 6. Synthesize authoritative session payload (SES v4.5 Simple by Default)
+    // Preserves exact className without silent destructive rewriting
+    const newSession: AttendanceSession = {
+      id: `SES-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`,
+      subjectId: subject.id,
+      subjectCode: subject.code,
+      subjectName: subject.name,
+      className: className,
+      teachingAssignmentId: resolvedTeachingAssignmentId,
+      lecturerId: lecturer.id,
+      lecturerName: lecturer.name,
+      lecturerEmail: lecturer.email,
+      sessionName: `${subject.code} - ${className}`,
+      date: dateStr,
+      startTime: timeStr,
+      endTime: '',
+      status: 'OPEN',
+      attendanceMethod: 'QR',
+      targetCount,
+      actualCount: 0,
+      createdAt: now.toISOString(),
+      updatedAt: now.toISOString()
+    };
+
+    // addSession automatically closes any prior OPEN session for this lecturer (Single Active Session invariant)
+    this.addSession(newSession);
+    return { session: newSession, isExisting: false, closedPreviousSession: prevOpen, conflictingSession: prevOpen };
+  }
+
+
+  public addAttendanceRecord(record: AttendanceRecord) {
+    // 1. Session safety check: Reject new attendance for CLOSED sessions
+    const targetSession = this.sessions.find((s) => s.id === record.sessionId);
+    if (targetSession && targetSession.status === 'CLOSED') {
+      console.warn(`[ATTENDANCE ENGINE] Rejected attendance record for CLOSED session ${record.sessionId}`);
+      return;
+    }
+
+    // 2. Idempotency check: Deduplicate rapid or repeated scans for same student in same session
+    if (record.status === 'PRESENT') {
+      const alreadyPresent = this.attendanceRecords.some(
+        (r) =>
+          r.sessionId === record.sessionId &&
+          (r.studentId.toUpperCase() === record.studentId.toUpperCase() ||
+            normalizeStudentId(r.studentId) === normalizeStudentId(record.studentId) ||
+            stripStudentId(r.studentId) === stripStudentId(record.studentId)) &&
+          r.status === 'PRESENT'
+      );
+      if (alreadyPresent) {
+        return; // Idempotent no-op
+      }
+    }
+
+    this.attendanceRecords = [record, ...this.attendanceRecords.filter((r) => r.id !== record.id)];
+    this.saveRecordsLocally();
+
+    if (db) {
+      setDoc(doc(db, 'attendance_records', record.id), sanitizeForFirestore(record), { merge: true }).catch(console.warn);
+    }
+  }
+
+  public saveAttendanceRecords(records: AttendanceRecord[]) {
+    this.attendanceRecords = records;
+    this.saveRecordsLocally();
+
+    if (db) {
+      records.forEach((record) => {
+        setDoc(doc(db, 'attendance_records', record.id), sanitizeForFirestore(record), { merge: true }).catch(console.warn);
+      });
+    }
+  }
+
+  // --- CORE ATTENDANCE SCANNING & VERIFICATION ENGINE ---
+  public processScan(
+    qrString: string,
+    method: AttendanceMethod = 'CAMERA_SCAN',
+    targetSessionId?: string,
+    callingLecturer?: Lecturer | null
+  ): ScanResult {
+    const now = new Date().toISOString();
+
+    // 1. Identify Target Class Session
+    let activeSession: AttendanceSession | null = null;
+    if (targetSessionId) {
+      const targetSession = this.sessions.find((s) => s.id === targetSessionId);
+      if (targetSession && targetSession.status === 'CLOSED') {
+        return {
+          success: false,
+          code: 'SESSION_CLOSED',
+          message: 'Sesi kelas telah ditamatkan (CLOSED). Rekod kehadiran baharu tidak dibenarkan.',
+          timestamp: now,
+          session: targetSession
+        };
+      }
+      activeSession = targetSession && targetSession.status === 'OPEN' ? targetSession : null;
+    } else {
+      activeSession = this.getActiveSession();
+    }
+
+    if (!activeSession || activeSession.status !== 'OPEN') {
+      return {
+        success: false,
+        code: 'NO_ACTIVE_EVENT',
+        message: 'Tiada sesi kelas yang aktif atau dibuka pada masa ini.',
+        timestamp: now
+      };
+    }
+
+    // 1b. Check Lecturer Authorization Boundary (SES v4.5 Operational Safety)
+    const lecturerToCheck = callingLecturer !== undefined ? callingLecturer : this.activeLecturer;
+    if (lecturerToCheck && lecturerToCheck.role !== 'ADMIN') {
+      const isAuthorized = isLecturerAuthorizedForSession(
+        activeSession,
+        lecturerToCheck,
+        false,
+        this.teachingAssignments
+      );
+      if (!isAuthorized) {
+        return {
+          success: false,
+          code: 'UNAUTHORIZED_LECTURER',
+          message: 'Akses ditolak: Pensyarah tidak mempunyai kebenaran untuk merekod kehadiran sesi ini.',
+          timestamp: now,
+          session: activeSession
+        };
+      }
+    }
+
+    // 2. Parse and validate student identifier from QR
+    const studentId = this.parseStudentQR(qrString);
+    if (!studentId) {
+      return {
+        success: false,
+        code: 'INVALID_QR',
+        message: 'Format kod QR tidak sah atau tidak dikenali.',
+        timestamp: now,
+        session: activeSession
+      };
+    }
+
+    // 3. Find student in Master Data
+    const student = this.getStudentById(studentId);
+    if (!student) {
+      return {
+        success: false,
+        code: 'STUDENT_NOT_FOUND',
+        message: `Pelajar dengan No. ID [${studentId}] tiada dalam senarai kelas.`,
+        timestamp: now,
+        session: activeSession
+      };
+    }
+
+    // 4. Check if student matches class if session is restricted to specific class
+    if (activeSession.className && activeSession.className !== 'ALL' && activeSession.className !== 'SEMUA') {
+      const allowedClasses = activeSession.className.split(',').map((c) => c.trim().toUpperCase());
+      const studentClass = student.className.trim().toUpperCase();
+      
+      const isEnrolledInSession = this.enrollments.some(
+        (e) =>
+          e.studentId.toUpperCase() === student.id.toUpperCase() &&
+          e.subjectCode.toUpperCase() === (activeSession!.subjectCode || '').toUpperCase() &&
+          allowedClasses.includes(e.className.trim().toUpperCase()) &&
+          e.status !== 'DROPPED'
+      );
+
+      if (!allowedClasses.includes(studentClass) && !isEnrolledInSession) {
+        return {
+          success: false,
+          code: 'CLASS_MISMATCH',
+          message: `Amaran: Pelajar ${student.name} dari kelas [${student.className}], bukan dalam senarai kelas sesi ini [${activeSession.className}].`,
+          student,
+          session: activeSession,
+          timestamp: now
+        };
+      }
+    }
+
+    // 5. Duplicate Check: One student per class session
+    const isAlreadyRecorded = this.attendanceRecords.some(
+      (r) =>
+        r.sessionId === activeSession!.id &&
+        (r.studentId === student.id ||
+          r.studentId === student.studentId ||
+          normalizeStudentId(r.studentId) === normalizeStudentId(student.studentId || student.id) ||
+          stripStudentId(r.studentId) === stripStudentId(student.studentId || student.id)) &&
+        r.status === 'PRESENT'
+    );
+
+    if (isAlreadyRecorded) {
+      const existingRecord = this.attendanceRecords.find(
+        (r) =>
+          r.sessionId === activeSession!.id &&
+          (r.studentId === student.id ||
+            r.studentId === student.studentId ||
+            normalizeStudentId(r.studentId) === normalizeStudentId(student.studentId || student.id) ||
+            stripStudentId(r.studentId) === stripStudentId(student.studentId || student.id))
+      );
+      return {
+        success: false,
+        code: 'ALREADY_RECORDED',
+        isDuplicate: true,
+        message: `Kehadiran ${student.name} telah direkodkan sebelum ini.`,
+        student,
+        session: activeSession,
+        timestamp: now,
+        record: existingRecord
+      };
+    }
+
+    // 6. Create new Attendance Record
+    const newRecord: AttendanceRecord = {
+      id: `REC-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      sessionId: activeSession.id,
+      studentId: student.studentId || student.id,
+      timestamp: now,
+      status: 'PRESENT',
+      method: method,
+      subjectCode: activeSession.subjectCode,
+      className: student.className
+    };
+
+    this.addAttendanceRecord(newRecord);
+
+    return {
+      success: true,
+      code: 'RECORDED',
+      message: `Kehadiran berjaya direkodkan: ${student.name} (${student.className})`,
+      student,
+      session: activeSession,
+      timestamp: now,
+      record: newRecord
+    };
+  }
+
+  public parseStudentQR(rawString: string): string | null {
+    if (!rawString) return null;
+    const clean = rawString.trim();
+
+    // Check for CLASSATTEND|PDA-2502-005 format
+    if (clean.startsWith('CLASSATTEND|')) {
+      const parts = clean.split('|');
+      const id = parts[1]?.trim() || '';
+      return id ? normalizeStudentId(id) : null;
+    }
+
+    // Check for STUDENT|PDA-2502-005 format
+    if (clean.startsWith('STUDENT|')) {
+      const parts = clean.split('|');
+      const id = parts[1]?.trim() || '';
+      return id ? normalizeStudentId(id) : null;
+    }
+
+    // Check for legacy STAFF|ST001 format
+    if (clean.startsWith('STAFF|')) {
+      const parts = clean.split('|');
+      const id = parts[1]?.trim() || '';
+      return id ? normalizeStudentId(id) : null;
+    }
+
+    // Check for JSON payload: { studentId: "PDA-2502-005" } or { id: "PDA-2502-005" }
+    if (clean.startsWith('{') && clean.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(clean);
+        const resolvedId = parsed.studentId || parsed.id || parsed.noPelajar || null;
+        return resolvedId ? normalizeStudentId(resolvedId) : null;
+      } catch {
+        // Not valid JSON
+      }
+    }
+
+    // Direct PDA-2502-XXX or PDA2502032 format check
+    return normalizeStudentId(clean);
+  }
+
+  // --- CLASS ANALYTICS & REPORTING COMPUTATIONS ---
+  public getSessionAttendanceSummary(sessionId: string) {
+    const session = this.sessions.find((s) => s.id === sessionId);
+    if (!session) return null;
+
+    const sessionRecords = this.attendanceRecords.filter((r) => r.sessionId === sessionId);
+    const presentRecords = sessionRecords.filter((r) => r.status === 'PRESENT');
+
+    // Use session targetCount snapshot if available, otherwise resolve from authoritative active enrollments
+    let totalStudents = typeof session.targetCount === 'number' && session.targetCount > 0 ? session.targetCount : 0;
+    if (totalStudents === 0 && session.subjectCode && session.className) {
+      const activeEnrollments = this.getEnrollmentsForSubjectClass(session.subjectCode, session.className);
+      totalStudents = activeEnrollments.length;
+    }
+    if (totalStudents === 0 && session.className && session.className !== 'ALL' && session.className !== 'SEMUA') {
+      totalStudents = this.students.filter((s) => areClassesMatching(s.className, session.className)).length;
+    }
+
+    const presentCount = presentRecords.length;
+    const absentCount = Math.max(0, totalStudents - presentCount);
+    const percentage = totalStudents > 0 ? Math.round((presentCount / totalStudents) * 100) : 0;
+
+    return {
+      session,
+      totalStudents,
+      presentCount,
+      absentCount,
+      percentage,
+      records: sessionRecords
+    };
+  }
+
+  public getStudentOverallSummary(studentId: string) {
+    const student = this.getStudentById(studentId);
+    if (!student) return null;
+
+    // Find all sessions applicable to this student's class
+    const applicableSessions = this.sessions.filter((session) => {
+      if (session.status === 'ARCHIVED') return false;
+      if (session.className && session.className !== 'ALL' && session.className !== 'SEMUA') {
+        const allowed = session.className.split(',').map((c) => c.trim().toUpperCase());
+        if (!allowed.includes(student.className.trim().toUpperCase())) return false;
+      }
+      return true;
+    });
+
+    const totalSessions = applicableSessions.length;
+    const studentRecords = this.attendanceRecords.filter(
+      (r) =>
+        (r.studentId === student.id ||
+          r.studentId === student.studentId ||
+          normalizeStudentId(r.studentId) === normalizeStudentId(student.studentId || student.id) ||
+          stripStudentId(r.studentId) === stripStudentId(student.studentId || student.id)) &&
+        r.status === 'PRESENT'
+    );
+    const presentCount = studentRecords.length;
+    const absentCount = Math.max(0, totalSessions - presentCount);
+    const percentage = totalSessions > 0 ? Math.round((presentCount / totalSessions) * 100) : 0;
+
+    // Breakdown by subject
+    const subjectBreakdown: Record<string, { total: number; present: number; percentage: number }> = {};
+
+    applicableSessions.forEach((session) => {
+      const subjKey = session.subjectCode || session.subjectName || 'AM';
+      
+      if (!subjectBreakdown[subjKey]) {
+        subjectBreakdown[subjKey] = { total: 0, present: 0, percentage: 0 };
+      }
+      subjectBreakdown[subjKey].total += 1;
+
+      const attended = studentRecords.some((r) => r.sessionId === session.id);
+      if (attended) {
+        subjectBreakdown[subjKey].present += 1;
+      }
+    });
+
+    Object.keys(subjectBreakdown).forEach((key) => {
+      const item = subjectBreakdown[key];
+      item.percentage = item.total > 0 ? Math.round((item.present / item.total) * 100) : 0;
+    });
+
+    // Recent records
+    const recentRecords = studentRecords.slice(0, 10).map((record) => {
+      const session = this.sessions.find((s) => s.id === record.sessionId)!;
+      return { record, session };
+    });
+
+    return {
+      student,
+      totalSessions,
+      presentCount,
+      absentCount,
+      percentage,
+      subjectBreakdown,
+      recentRecords
+    };
+  }
+
+  // --- Backward compatibility aliases ---
+  public subscribeActivities(callback: (activities: any[]) => void) {
+    return this.subscribeSessions(callback);
+  }
+  public getActivities() {
+    return this.getSessions();
+  }
+  public addActivity(activity: any) {
+    return this.addSession(activity);
+  }
+  public deleteActivity(id: string) {
+    return this.deleteSession(id);
+  }
+  public subscribeStaff(callback: (staff: Student[]) => void) {
+    return this.subscribeStudents(callback);
+  }
+  public subscribeEvents(callback: (events: AttendanceSession[]) => void) {
+    return this.subscribeSessions(callback);
+  }
+  public getStaffList() {
+    return this.getStudents();
+  }
+  public getEvents() {
+    return this.getSessions();
+  }
+  public saveStaffList(staff: Student[]) {
+    this.saveStudentsList(staff);
+  }
+  public saveEvents(events: AttendanceSession[]) {
+    this.saveSessions(events);
+  }
+  public setEventStatus(eventId: string, newStatus: EventStatus) {
+    return this.setSessionStatus(eventId, newStatus);
+  }
+  public deleteStaff(staffId: string) {
+    this.deleteStudent(staffId);
+  }
+}
+
+export const attendanceEngine = new AttendanceEngine();
+

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ms">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>Class Attend — Sistem Pengurusan Kehadiran Pelajar</title>
+
+    <!-- PWA Primary Meta Tags -->
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="description" content="Sistem Pengurusan Kehadiran Khusus Kelas, Subjek dan Seksyen Pelajar KPM Bandar Penawar dengan Pengesahan Pensyarah (@mara.gov.my) &amp; Kod QR." />
+    <link rel="manifest" href="/manifest.json" />
+
+    <!-- Favicons & Apple Touch Icon (Official ClassAttend Assets) -->
+    <link rel="icon" type="image/svg+xml" href="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="16x16" href="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/favicon-16x16.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/favicon-32x32.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/favicon-48x48.png" />
+    <link rel="icon" type="image/png" sizes="96x96" href="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/favicon-96x96.png" />
+    <link rel="apple-touch-icon" href="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/apple-touch-icon.png" />
+
+    <!-- Open Graph / Facebook / WhatsApp / Telegram Meta Tags -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Class Attend" />
+    <meta property="og:description" content="Sistem Pengurusan Kehadiran Khusus Kelas, Subjek dan Seksyen Pelajar KPM Bandar Penawar dengan Pengesahan Pensyarah (@mara.gov.my) &amp; Kod QR." />
+    <meta property="og:image" content="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/OGI%20ClassAttend.jpg" />
+    <meta property="og:image:alt" content="ClassAttend" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:site_name" content="ClassAttend" />
+
+    <!-- Twitter Card Meta Tags -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="ClassAttend" />
+    <meta name="twitter:description" content="ClassAttend — Sistem Kehadiran Pelajar" />
+    <meta name="twitter:image" content="https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/OGI%20ClassAttend.jpg" />
+
+    <!-- iOS / Safari PWA support -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ClassAttend" />
+
+    <!-- Cache Busting for Browser Navigation -->
+    <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <!-- Immediate Cache Busting & ServiceWorker Unregistration -->
+    <script>
+      (function() {
+        var APP_BUILD_ID = 'mara-2026-v8';
+        var lastBuild = localStorage.getItem('classattend_build_id');
+
+        // 1. Immediately wipe all browser cache storages
+        if ('caches' in window) {
+          caches.keys().then(function(names) {
+            for (var i = 0; i < names.length; i++) {
+              caches.delete(names[i]);
+            }
+          });
+        }
+
+        // 2. Unregister ALL service workers immediately
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.getRegistrations().then(function(registrations) {
+            for (var i = 0; i < registrations.length; i++) {
+              registrations[i].unregister();
+            }
+          });
+        }
+
+        // 3. Remove legacy saved emails or stale sessions containing bpenawar
+        try {
+          var saved = localStorage.getItem('classattend_saved_lecturer_email');
+          if (saved && (saved.indexOf('bpenawar') !== -1 || saved.indexOf('@mara.gov.my') === -1)) {
+            localStorage.removeItem('classattend_saved_lecturer_email');
+          }
+          var trusted = localStorage.getItem('syncrozz_trusted_access_v1');
+          if (trusted && trusted.indexOf('bpenawar') !== -1) {
+            localStorage.removeItem('syncrozz_trusted_access_v1');
+            localStorage.removeItem('classattend_active_lecturer_v5');
+          }
+        } catch(e) {}
+
+        // 4. One-time clean cache-busting URL navigation
+        if (lastBuild !== APP_BUILD_ID) {
+          localStorage.setItem('classattend_build_id', APP_BUILD_ID);
+          if (!window.location.search.includes('v=' + APP_BUILD_ID)) {
+            var url = window.location.pathname + '?v=' + APP_BUILD_ID + window.location.hash;
+            window.location.replace(url);
+          }
+        }
+      })();
+    </script>
+  </head>
+  <body class="bg-slate-950 text-slate-100 antialiased selection:bg-indigo-500 selection:text-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
+

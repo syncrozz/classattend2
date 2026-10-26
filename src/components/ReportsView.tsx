@@ -1,0 +1,1120 @@
+import React, { useState, useMemo, useEffect } from 'react';
+import {
+  Student,
+  AttendanceSession,
+  Subject,
+  AttendanceRecord,
+  Lecturer,
+  Enrollment,
+  TeachingAssignment
+} from '../types';
+import { areClassesMatching, normalizeClassCode } from '../utils/classHelper';
+import { filterAuthorizedSessions } from '../utils/sessionAuth';
+import {
+  getClassBadgeColor,
+  getInitials,
+  getStudentColor,
+  sortSessionsLatestFirst,
+  stripStudentId
+} from '../utils/studentUtils';
+import {
+  exportSessionAttendanceToCSV,
+  exportScannedAttendeesOnlyToCSV,
+  exportAllAttendanceRecordsToCSV,
+  generateAttendanceBackupJSON,
+  downloadCSV,
+  downloadJSON
+} from '../utils/csvHelper';
+import { AttendanceMatrixView } from './AttendanceMatrixView';
+import {
+  generateWhatsAppWarningLink
+} from '../utils/whatsappHelper';
+import {
+  Download,
+  Printer,
+  Search,
+  CheckCircle2,
+  XCircle,
+  BookOpen,
+  UserCheck,
+  Award,
+  Layers,
+  BarChart3,
+  Users,
+  Lock,
+  FileSpreadsheet,
+  HardDrive,
+  ChevronLeft,
+  ChevronRight
+} from 'lucide-react';
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+  Cell
+} from 'recharts';
+
+interface ReportsViewProps {
+  students: Student[];
+  sessions: AttendanceSession[];
+  subjects?: Subject[];
+  attendanceRecords: AttendanceRecord[];
+  enrollments?: Enrollment[];
+  teachingAssignments?: TeachingAssignment[];
+  isAdmin?: boolean;
+  activeLecturer?: Lecturer | null;
+  onRequestAdminAccess?: (actionName?: string) => void;
+  onDeleteSession?: (sessionId: string) => void;
+  onAddStudent?: (student: Student) => void;
+  onUpdateStudent?: (student: Student) => void;
+  onDeleteStudent?: (studentId: string) => void;
+}
+
+export const ReportsView: React.FC<ReportsViewProps> = ({
+  students,
+  sessions,
+  subjects = [],
+  attendanceRecords,
+  enrollments = [],
+  teachingAssignments = [],
+  isAdmin = false,
+  activeLecturer = null,
+  onRequestAdminAccess,
+  onDeleteSession,
+  onAddStudent,
+  onUpdateStudent,
+  onDeleteStudent
+}) => {
+  // Determine if lecturer privacy scoping is active (True when lecturer is logged in and not an Admin)
+  const isLecturerRestricted = Boolean(activeLecturer && !isAdmin && activeLecturer.role !== 'ADMIN');
+
+  // Authorized sessions: When restricted, only sessions belonging to this lecturer are accessible
+  const authorizedSessions = useMemo(() => {
+    if (!isLecturerRestricted) {
+      return sortSessionsLatestFirst(sessions);
+    }
+    return filterAuthorizedSessions(sessions, activeLecturer, isAdmin, teachingAssignments);
+  }, [sessions, activeLecturer, isAdmin, teachingAssignments, isLecturerRestricted]);
+
+  // Lecturer assigned classes: derived from Teaching Assignments, lecturer profile, and authorized sessions
+  const lecturerClasses = useMemo(() => {
+    if (!isLecturerRestricted || !activeLecturer) {
+      return null; // Admin sees all classes
+    }
+    const classSet = new Set<string>();
+
+    // 1. From Teaching Assignments (authoritative)
+    (teachingAssignments || []).forEach((ta) => {
+      const isActive = ta.status === 'ACTIVE';
+      const matchId = ta.lecturerId === activeLecturer.id;
+      const matchEmail = Boolean(
+        ta.lecturerEmail &&
+        activeLecturer.email &&
+        ta.lecturerEmail.trim().toLowerCase() === activeLecturer.email.trim().toLowerCase()
+      );
+      const matchName = Boolean(
+        ta.lecturerName &&
+        activeLecturer.name &&
+        ta.lecturerName.trim().toLowerCase() === activeLecturer.name.trim().toLowerCase()
+      );
+      if (isActive && (matchId || matchEmail || matchName) && ta.className) {
+        classSet.add(ta.className.trim());
+      }
+    });
+
+    // 2. From assignedClasses / assignedSections on lecturer profile
+    const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
+    profileClasses.forEach((cls) => {
+      if (cls && cls.trim()) classSet.add(cls.trim());
+    });
+
+    // 3. From authorized sessions
+    authorizedSessions.forEach((s) => {
+      if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
+        classSet.add(s.className.trim());
+      }
+    });
+
+    return Array.from(classSet);
+  }, [isLecturerRestricted, activeLecturer, teachingAssignments, authorizedSessions]);
+
+  // Unique classes dynamically scoped:
+  // If lecturer restricted, strictly classes taught by this lecturer.
+  // Otherwise, all classes registered in students/sessions.
+  const uniqueClasses: string[] = useMemo(() => {
+    if (lecturerClasses !== null) {
+      const filtered = Array.from(
+        new Set([
+          ...lecturerClasses,
+          ...(authorizedSessions.map((s) => s.className?.trim()).filter(Boolean) as string[])
+        ])
+      ).filter((c) => c && c !== 'ALL' && c !== 'SEMUA');
+
+      return filtered.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    }
+
+    return Array.from(
+      new Set([
+        ...(students.map((s) => s.className?.trim()).filter(Boolean) as string[]),
+        ...(sessions.map((s) => s.className?.trim()).filter(Boolean) as string[])
+      ])
+    ).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  }, [students, sessions, authorizedSessions, lecturerClasses]);
+
+  // Scoped students: Only students belonging to the lecturer's assigned classes
+  const scopedStudents = useMemo(() => {
+    if (lecturerClasses === null) {
+      return students;
+    }
+    return students.filter((st) =>
+      lecturerClasses.some((c) => areClassesMatching(c, st.className))
+    );
+  }, [students, lecturerClasses]);
+
+  // Scoped attendance records: Only records belonging to the lecturer's authorized sessions
+  const scopedAttendanceRecords = useMemo(() => {
+    if (!isLecturerRestricted) {
+      return attendanceRecords;
+    }
+    const authorizedSessionIds = new Set(authorizedSessions.map((s) => s.id));
+    return attendanceRecords.filter((r) => authorizedSessionIds.has(r.sessionId));
+  }, [attendanceRecords, authorizedSessions, isLecturerRestricted]);
+
+  const [reportPerspective, setReportPerspective] = useState<'SESSION' | 'CLASS' | 'MATRIX'>('MATRIX');
+  const [selectedSessionId, setSelectedSessionId] = useState<string>(() => authorizedSessions[0]?.id || '');
+  const [selectedClassSection, setSelectedClassSection] = useState<string>(() => uniqueClasses[0] || 'DIA_4A');
+  const [filterSet, setFilterSet] = useState<string>('ALL');
+  const [filterStatus, setFilterStatus] = useState<string>('ALL');
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [backupToast, setBackupToast] = useState<string | null>(null);
+
+  // Synchronize selectedSessionId when authorized sessions change
+  useEffect(() => {
+    if (authorizedSessions.length > 0 && !authorizedSessions.some((s) => s.id === selectedSessionId)) {
+      setSelectedSessionId(authorizedSessions[0].id);
+    }
+  }, [authorizedSessions, selectedSessionId]);
+
+  // Synchronize selectedClassSection when unique classes change
+  useEffect(() => {
+    if (uniqueClasses.length > 0 && !uniqueClasses.some((c) => areClassesMatching(c, selectedClassSection))) {
+      setSelectedClassSection(uniqueClasses[0]);
+    }
+  }, [uniqueClasses, selectedClassSection]);
+
+  const currentSession = authorizedSessions.find((s) => s.id === selectedSessionId) || authorizedSessions[0];
+
+  // Records for current session
+  const sessionRecords = currentSession
+    ? scopedAttendanceRecords.filter((r) => r.sessionId === currentSession.id)
+    : [];
+
+  const recordMap = new Map<string, AttendanceRecord>();
+  sessionRecords.forEach((r) => recordMap.set(r.studentId, r));
+
+  // Determine target students for current session:
+  // SES v4.5 Authoritative subject enrollment: Active students in (subjectCode, className)
+  let targetStudents = scopedStudents;
+  if (currentSession?.subjectCode && enrollments && enrollments.length > 0) {
+    const cleanSub = currentSession.subjectCode.trim().toUpperCase();
+    const normClass = normalizeClassCode(currentSession.className);
+
+    const activeEnrollments = enrollments.filter((e) => {
+      const matchSub = (e.subjectCode || '').trim().toUpperCase() === cleanSub;
+      const matchClass = !normClass || normClass === 'ALL' || normClass === 'SEMUA' || normalizeClassCode(e.className) === normClass;
+      const isActive = e.status === 'ACTIVE' || (!e.status && e.status !== 'DROPPED');
+      return matchSub && matchClass && isActive;
+    });
+
+    const enrolledIds = new Set(activeEnrollments.map((e) => (e.studentId || '').trim().toUpperCase()));
+    targetStudents = scopedStudents.filter((s) => {
+      const sId = (s.studentId || '').trim().toUpperCase();
+      const id = (s.id || '').trim().toUpperCase();
+      return enrolledIds.has(sId) || enrolledIds.has(id);
+    });
+  } else if (currentSession?.className) {
+    targetStudents = scopedStudents.filter((s) => areClassesMatching(s.className, currentSession.className));
+  }
+
+  // Filtered by set & status & search
+  const filteredSessionStudents = targetStudents.filter((student) => {
+    const matchesSet = filterSet === 'ALL' || areClassesMatching(student.className, filterSet);
+    const isPresent = recordMap.has(student.id) && recordMap.get(student.id)?.status === 'PRESENT';
+    const matchesStatus =
+      filterStatus === 'ALL' ||
+      (filterStatus === 'PRESENT' && isPresent) ||
+      (filterStatus === 'ABSENT' && !isPresent);
+
+    const q = searchQuery.toLowerCase().trim();
+    const qStripped = stripStudentId(searchQuery);
+    const matchesSearch =
+      student.name.toLowerCase().includes(q) ||
+      (qStripped.length >= 2 && stripStudentId(student.studentId).includes(qStripped)) ||
+      student.studentId.toLowerCase().includes(q);
+
+    return matchesSet && matchesStatus && matchesSearch;
+  });
+
+  const totalTargetCount = typeof currentSession?.targetCount === 'number' && currentSession.targetCount >= 0
+    ? currentSession.targetCount
+    : targetStudents.length;
+  const presentCount = targetStudents.filter((s) => recordMap.has(s.id) && recordMap.get(s.id)?.status === 'PRESENT').length;
+  const absentCount = Math.max(0, totalTargetCount - presentCount);
+  const sessionPercent = totalTargetCount > 0 ? Math.round((presentCount / totalTargetCount) * 100) : 0;
+
+  // Chart Data: Class Section Performance for current session
+  const setPerformanceData = uniqueClasses.map((setName) => {
+    const classTotal = scopedStudents.filter((s) => areClassesMatching(s.className, setName)).length;
+    const classPresent = scopedStudents.filter(
+      (s) => areClassesMatching(s.className, setName) && recordMap.has(s.id) && recordMap.get(s.id)?.status === 'PRESENT'
+    ).length;
+    const rate = classTotal > 0 ? Math.round((classPresent / classTotal) * 100) : 0;
+    return {
+      name: setName,
+      Hadir: classPresent,
+      Jumlah: classTotal,
+      Peratus: rate
+    };
+  });
+
+  // Handle Export Session CSV
+  const handleExportSessionCSV = () => {
+    if (!currentSession) return;
+    if (!isAdmin && !activeLecturer && onRequestAdminAccess) {
+      onRequestAdminAccess(`Eksport Data Laporan Kehadiran (${currentSession.sessionName})`);
+      return;
+    }
+    const csvContent = exportSessionAttendanceToCSV(currentSession, scopedStudents, scopedAttendanceRecords);
+    downloadCSV(csvContent, `Laporan_Kehadiran_Kelas_${currentSession.sessionName.replace(/\s+/g, '_')}.csv`);
+  };
+
+  // Handle Backup Scanned Attendees for Selected Session
+  const handleBackupCurrentSessionScannedCSV = () => {
+    if (!currentSession) return;
+    const csvContent = exportScannedAttendeesOnlyToCSV(currentSession, scopedStudents, scopedAttendanceRecords);
+    const dateStr = currentSession.date || new Date().toISOString().split('T')[0];
+    const subStr = (currentSession.subjectCode || currentSession.sessionName || 'Kelas').replace(/[\s/]/g, '_');
+    downloadCSV(csvContent, `Backup_Pelajar_Hadir_${subStr}_${dateStr}.csv`);
+    setBackupToast(`Backup kehadiran (${presentCount} pelajar hadir) berjaya dimuat turun!`);
+    setTimeout(() => setBackupToast(null), 4000);
+  };
+
+  // Handle Backup ALL Attendance Records Scoped to Authorized Classes
+  const handleBackupAllAttendanceCSV = () => {
+    if (!isAdmin && !activeLecturer && onRequestAdminAccess) {
+      onRequestAdminAccess('Backup Semua Rekod Kehadiran Kolej');
+      return;
+    }
+    const csvContent = exportAllAttendanceRecordsToCSV(scopedAttendanceRecords, scopedStudents, authorizedSessions);
+    const dateStr = new Date().toISOString().split('T')[0];
+    const label = activeLecturer ? `Pensyarah_${activeLecturer.name.replace(/\s+/g, '_')}` : 'Kolej';
+    downloadCSV(csvContent, `Backup_Rekod_Kehadiran_${label}_${dateStr}.csv`);
+    setBackupToast(`Backup keseluruhan (${scopedAttendanceRecords.length} rekod) berjaya dimuat turun!`);
+    setTimeout(() => setBackupToast(null), 4000);
+  };
+
+  // Handle Full JSON Backup
+  const handleBackupAllAttendanceJSON = () => {
+    if (!isAdmin && !activeLecturer && onRequestAdminAccess) {
+      onRequestAdminAccess('Backup JSON Penuh Sistem');
+      return;
+    }
+    const jsonContent = generateAttendanceBackupJSON(
+      scopedAttendanceRecords,
+      scopedStudents,
+      authorizedSessions,
+      activeLecturer?.name || 'Pentadbir'
+    );
+    const dateStr = new Date().toISOString().split('T')[0];
+    downloadJSON(jsonContent, `Arkib_Backup_Kehadiran_ClassAttend_${dateStr}.json`);
+    setBackupToast('Arkib fail JSON penuh berjaya disimpan & dimuat turun!');
+    setTimeout(() => setBackupToast(null), 4000);
+  };
+
+  // Class-Perspective Data Calculations
+  const classSummaryStats = uniqueClasses.map((clsName) => {
+    const classStudents = scopedStudents.filter((s) => areClassesMatching(s.className, clsName));
+    const applicableSessions = authorizedSessions.filter((s) => !s.className || areClassesMatching(s.className, clsName));
+    const totalSlots = classStudents.length * applicableSessions.length;
+    const presentSlots = scopedAttendanceRecords.filter(
+      (r) =>
+        r.status === 'PRESENT' &&
+        classStudents.some((s) => s.id === r.studentId) &&
+        applicableSessions.some((sess) => sess.id === r.sessionId)
+    ).length;
+    const rate = totalSlots > 0 ? Math.round((presentSlots / totalSlots) * 100) : 0;
+
+    return {
+      name: clsName,
+      totalStudents: classStudents.length,
+      sessionCount: applicableSessions.length,
+      presentSlots,
+      totalSlots,
+      rate
+    };
+  });
+
+  // Specific selected class student records
+  const targetClassStudents = scopedStudents.filter((s) => areClassesMatching(s.className, selectedClassSection));
+  const targetClassSessions = authorizedSessions.filter((s) => !s.className || areClassesMatching(s.className, selectedClassSection));
+
+  const selectedClassStudentStats = targetClassStudents
+    .filter((st) => {
+      const q = searchQuery.toLowerCase().trim();
+      const qStripped = stripStudentId(searchQuery);
+      return (
+        st.name.toLowerCase().includes(q) ||
+        (qStripped.length >= 2 && stripStudentId(st.studentId).includes(qStripped)) ||
+        st.studentId.toLowerCase().includes(q)
+      );
+    })
+    .map((st) => {
+      const studentRecs = scopedAttendanceRecords.filter((r) => r.studentId === st.id && r.status === 'PRESENT');
+      const rate = targetClassSessions.length > 0 ? Math.round((studentRecs.length / targetClassSessions.length) * 100) : 0;
+
+      return {
+        student: st,
+        present: studentRecs.length,
+        total: targetClassSessions.length,
+        rate
+      };
+    });
+
+  // Pagination for Class Analysis table
+  const [analysisPage, setAnalysisPage] = useState<number>(1);
+  const [analysisPerPage, setAnalysisPerPage] = useState<number>(10);
+
+  const totalAnalysisPages = Math.max(1, Math.ceil(selectedClassStudentStats.length / analysisPerPage));
+
+  React.useEffect(() => {
+    setAnalysisPage(1);
+  }, [selectedClassSection, searchQuery]);
+
+  React.useEffect(() => {
+    if (analysisPage > totalAnalysisPages) {
+      setAnalysisPage(totalAnalysisPages);
+    }
+  }, [analysisPage, totalAnalysisPages]);
+
+  const paginatedClassStudentStats = useMemo(() => {
+    const startIndex = (analysisPage - 1) * analysisPerPage;
+    return selectedClassStudentStats.slice(startIndex, startIndex + analysisPerPage);
+  }, [selectedClassStudentStats, analysisPage, analysisPerPage]);
+
+  // Export Class Specific CSV
+  const handleExportClassCSV = () => {
+    if (!isAdmin && !activeLecturer && onRequestAdminAccess) {
+      onRequestAdminAccess(`Eksport Laporan Kehadiran Kelas ${selectedClassSection}`);
+      return;
+    }
+    const headers = 'Bil,No_Pelajar,Nama_Pelajar,Kelas,Jumlah_Sesi_Hadir,Jumlah_Sesi_Keseluruhan,Peratus_Kehadiran\n';
+    const rows = selectedClassStudentStats.map((item, idx) =>
+      `${idx + 1},"${item.student.studentId}","${item.student.name}","${item.student.className}",${item.present},${item.total},${item.rate}%`
+    ).join('\n');
+    downloadCSV(headers + rows, `Laporan_Kehadiran_Kelas_${selectedClassSection}.csv`);
+  };
+
+  return (
+    <div className="space-y-6 printable-report-container">
+      {/* Top Header & Perspective Switcher */}
+      <div className="rounded-2xl bg-slate-900/90 border border-slate-800 p-5 space-y-4 no-print shadow-lg">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
+              <span>Laporan Kehadiran</span>
+            </h2>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Backup & Export Quick Action Group */}
+            <div className="flex items-center gap-1.5 p-1 rounded-xl bg-slate-950 border border-slate-800">
+              <button
+                type="button"
+                id="btn-backup-all-records-csv"
+                onClick={handleBackupAllAttendanceCSV}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs font-bold transition-all cursor-pointer"
+                title="Muat turun & simpan backup semua rekod kehadiran pelajar yang telah diimbas (.CSV)"
+              >
+                <Download className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Backup Semua (.CSV)</span>
+              </button>
+              <button
+                type="button"
+                id="btn-backup-all-records-json"
+                onClick={handleBackupAllAttendanceJSON}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-semibold transition-all cursor-pointer"
+                title="Muat turun fail arkib JSON lengkap untuk keselamatan data"
+              >
+                <HardDrive className="w-3.5 h-3.5 text-indigo-400" />
+                <span className="hidden sm:inline">Backup JSON</span>
+              </button>
+            </div>
+
+            {/* Perspective Toggle (Matriks Kehadiran, Mengikut Kelas, Sesi Kuliah) */}
+            <div className="p-1 rounded-xl bg-slate-950 border border-slate-800 flex items-center gap-1">
+              <button
+                id="btn-report-perspective-matrix"
+                onClick={() => setReportPerspective('MATRIX')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  reportPerspective === 'MATRIX'
+                    ? 'bg-indigo-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                📊 Matriks Kehadiran
+              </button>
+              <button
+                id="btn-report-perspective-class"
+                onClick={() => setReportPerspective('CLASS')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  reportPerspective === 'CLASS'
+                    ? 'bg-indigo-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                👥 Mengikut Kelas
+              </button>
+              <button
+                id="btn-report-perspective-session"
+                onClick={() => setReportPerspective('SESSION')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                  reportPerspective === 'SESSION'
+                    ? 'bg-indigo-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                📅 Sesi Kuliah
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Filters Row (for Class, Session, Student views) */}
+        {reportPerspective !== 'MATRIX' && (
+          <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
+            <div className="flex flex-wrap items-center gap-2.5">
+              {reportPerspective === 'CLASS' && (
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-slate-400 font-semibold">Pilih Kelas:</span>
+                  <select
+                    value={selectedClassSection}
+                    onChange={(e) => setSelectedClassSection(e.target.value)}
+                    className="px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-bold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                  >
+                    {uniqueClasses.map((cls, clsIdx) => (
+                      <option key={`report-class-opt-${cls}-${clsIdx}`} value={cls}>Kelas {cls}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {reportPerspective === 'SESSION' && (
+                <select
+                  id="report-select-session"
+                  value={selectedSessionId}
+                  onChange={(e) => setSelectedSessionId(e.target.value)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-white focus:outline-none focus:border-indigo-500 cursor-pointer max-w-md"
+                >
+                  {authorizedSessions.map((s) => {
+                    const subjectDetail = s.subjectCode ? `[${s.subjectCode}] ` : '';
+                    const classDetail = s.className ? ` (${s.className})` : '';
+                    const dateDetail = s.date ? ` • ${s.date}` : '';
+                    const statusPrefix = s.status === 'OPEN' ? '🟢 [AKTIF] ' : '🔵 ';
+
+                    return (
+                      <option key={s.id} value={s.id}>
+                        {statusPrefix}{subjectDetail}{s.sessionName}{classDetail}{dateDetail}
+                      </option>
+                    );
+                  })}
+                </select>
+              )}
+
+              {reportPerspective !== 'CLASS' && (
+                <select
+                  value={filterSet}
+                  onChange={(e) => setFilterSet(e.target.value)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-slate-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                >
+                  <option value="ALL">Semua Kelas</option>
+                  {uniqueClasses.map((cls, clsIdx) => (
+                    <option key={`report-filter-set-opt-${cls}-${clsIdx}`} value={cls}>Kelas {cls}</option>
+                  ))}
+                </select>
+              )}
+
+              {reportPerspective === 'SESSION' && (
+                <select
+                  value={filterStatus}
+                  onChange={(e) => setFilterStatus(e.target.value)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-slate-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                >
+                  <option value="ALL">Semua Status</option>
+                  <option value="PRESENT">Hadir Sahaja</option>
+                  <option value="ABSENT">Tidak Hadir Sahaja</option>
+                </select>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2">
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
+                <input
+                  type="text"
+                  placeholder="Cari nama atau No. Pelajar..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="pl-8 pr-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-indigo-500 w-48 sm:w-56"
+                />
+              </div>
+
+              {reportPerspective === 'CLASS' ? (
+                <button
+                  onClick={handleExportClassCSV}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition-all cursor-pointer"
+                  title={!isAdmin && !activeLecturer ? 'Perlu pengesahan Pensyarah/Admin untuk eksport CSV' : 'Eksport Fail CSV Kelas Ini'}
+                >
+                  {!isAdmin && !activeLecturer ? <Lock className="w-3.5 h-3.5 text-amber-400" /> : <Download className="w-3.5 h-3.5" />}
+                  <span className="hidden sm:inline">Eksport Kelas</span>
+                </button>
+              ) : (
+                <button
+                  onClick={handleExportSessionCSV}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition-all cursor-pointer"
+                  title={!isAdmin && !activeLecturer ? 'Perlu pengesahan Pensyarah/Admin untuk eksport CSV' : 'Eksport Fail CSV'}
+                >
+                  {!isAdmin && !activeLecturer ? <Lock className="w-3.5 h-3.5 text-amber-400" /> : <Download className="w-3.5 h-3.5" />}
+                  <span className="hidden sm:inline">Eksport</span>
+                </button>
+              )}
+
+              <button
+                onClick={() => window.print()}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition-all cursor-pointer"
+                title="Cetak Lembaran Laporan"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Cetak</span>
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* PERSPECTIVE 4: ATTENDANCE MATRIX VIEW (SEMUA SESI DALAM 1 JADUAL) */}
+      {reportPerspective === 'MATRIX' && (
+        <AttendanceMatrixView
+          students={scopedStudents}
+          sessions={authorizedSessions}
+          subjects={subjects}
+          attendanceRecords={scopedAttendanceRecords}
+          uniqueClasses={uniqueClasses}
+          teachingAssignments={teachingAssignments}
+          isAdmin={isAdmin}
+          activeLecturer={activeLecturer}
+          onRequestAdminAccess={onRequestAdminAccess}
+          onDeleteSession={onDeleteSession}
+          onAddStudent={onAddStudent}
+          onUpdateStudent={onUpdateStudent}
+          onDeleteStudent={onDeleteStudent}
+        />
+      )}
+
+      {/* PERSPECTIVE 1: CLASS-CENTRIC (MENGIKUT KELAS MASING-MASING) */}
+      {reportPerspective === 'CLASS' && (
+        <div className="space-y-6">
+          {/* Class Section Overview Tiles */}
+          {classSummaryStats.length === 0 ? (
+            <div className="p-8 rounded-2xl bg-slate-900/60 border border-slate-800 text-center space-y-3">
+              <div className="w-12 h-12 mx-auto rounded-2xl bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+                <Users className="w-6 h-6" />
+              </div>
+              <h3 className="text-base font-bold text-white">Tiada Kelas Ditugaskan</h3>
+              <p className="text-xs text-slate-400 max-w-md mx-auto">
+                {isLecturerRestricted
+                  ? 'Akaun anda belum mempunyai sebarang kelas atau subjek yang ditugaskan. Sila hubungi Pentadbir Sistem untuk penetapan jadual pengajaran anda.'
+                  : 'Tiada rekod kelas ditemui dalam sistem.'}
+              </p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              {classSummaryStats.map((cls, clsIdx) => {
+              const isSelected = cls.name === selectedClassSection;
+              const isHigh = cls.rate >= 90;
+              const isMedium = cls.rate >= 75 && cls.rate < 90;
+
+              return (
+                <button
+                  key={`report-cls-tile-${cls.name}-${clsIdx}`}
+                  type="button"
+                  onClick={() => setSelectedClassSection(cls.name)}
+                  className={`p-4 rounded-xl text-left transition-all cursor-pointer space-y-2 border ${
+                    isSelected
+                      ? 'bg-indigo-950/60 border-indigo-500 ring-2 ring-indigo-500/20 shadow-lg'
+                      : 'bg-slate-900/80 border-slate-800 hover:border-slate-700'
+                  }`}
+                >
+                  {/* Baris 1: Nama Kelas */}
+                  <div className="flex items-center justify-between">
+                    <span className={`text-xs font-bold px-2.5 py-1 rounded-lg border ${getClassBadgeColor(cls.name)}`}>
+                      Kelas {cls.name}
+                    </span>
+                  </div>
+
+                  {/* Baris 2: Status KPI */}
+                  <div className="flex items-center">
+                    <span
+                      className={`inline-flex items-center text-[10px] font-bold px-2.5 py-0.5 rounded border ${
+                        cls.sessionCount === 0
+                          ? 'bg-slate-800 text-slate-400 border-slate-700'
+                          : cls.rate >= 80
+                          ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                          : 'bg-rose-500/10 text-rose-400 border-rose-500/30'
+                      }`}
+                    >
+                      {cls.sessionCount === 0
+                        ? '⚪ Belum Bermula'
+                        : cls.rate >= 80
+                        ? '✅ KPI Dipenuhi'
+                        : '❌ Perlu Surat Amaran'}
+                    </span>
+                  </div>
+
+                  <div className="flex items-baseline justify-between pt-1">
+                    <div>
+                      <div className="text-3xl font-black text-white">
+                        {cls.sessionCount > 0 ? (
+                          <>
+                            {cls.rate}<span className="text-lg text-indigo-400">%</span>
+                          </>
+                        ) : (
+                          <span className="text-lg text-slate-400 font-medium">Tiada Sesi</span>
+                        )}
+                      </div>
+                      <div className="text-[10px] text-slate-400">Purata Kehadiran</div>
+                    </div>
+                    <div className="text-right text-xs text-slate-300">
+                      <div className="font-bold">{cls.totalStudents} Pelajar</div>
+                      <div className="text-[10px] text-slate-500">{cls.sessionCount} Sesi Kuliah</div>
+                    </div>
+                  </div>
+
+                  <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all ${
+                        cls.sessionCount === 0
+                          ? 'bg-slate-700'
+                          : isHigh
+                          ? 'bg-emerald-400'
+                          : isMedium
+                          ? 'bg-indigo-400'
+                          : 'bg-amber-400'
+                      }`}
+                      style={{ width: `${cls.sessionCount > 0 ? cls.rate : 0}%` }}
+                    ></div>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          )}
+
+          {/* Table of Students in the Selected Class */}
+          <div className="rounded-2xl bg-slate-900/80 border border-slate-800 overflow-hidden shadow-lg">
+            <div className="p-4 bg-slate-900 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className={`text-xs font-bold px-2.5 py-1 rounded-lg border ${getClassBadgeColor(selectedClassSection)}`}>
+                  Kelas {selectedClassSection}
+                </span>
+                <span className="text-xs font-bold text-white">
+                  Senarai Terperinci Pelajar ({selectedClassStudentStats.length} Pelajar)
+                </span>
+              </div>
+              <div className="text-xs text-slate-400">
+                Jumlah Sesi Terlibat: <strong className="text-white">{targetClassSessions.length} Sesi</strong>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs text-slate-300">
+                <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] font-bold tracking-wider border-b border-slate-800">
+                  <tr>
+                    <th className="py-3 px-4">Bil</th>
+                    <th className="py-3 px-4">No. Pelajar</th>
+                    <th className="py-3 px-4">Nama Pelajar</th>
+                    <th className="py-3 px-4 text-center">Sesi Hadir</th>
+                    <th className="py-3 px-4 text-center">Peratus % Kehadiran</th>
+                    <th className="py-3 px-4 text-center">Status KPI</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {selectedClassStudentStats.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-8 text-center text-slate-500">
+                        Tiada pelajar ditemui untuk kelas {selectedClassSection}.
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedClassStudentStats.map((item, idx) => {
+                      const overallIdx = (analysisPage - 1) * analysisPerPage + idx + 1;
+                      const isHigh = item.rate >= 90;
+                      const isMedium = item.rate >= 75 && item.rate < 90;
+
+                      return (
+                        <tr key={item.student.id} className="hover:bg-slate-800/40 transition-colors">
+                          <td className="py-3 px-4 text-slate-500 font-mono">{overallIdx}</td>
+                          <td className="py-3 px-4 font-mono font-bold text-indigo-400">{item.student.studentId}</td>
+                          <td className="py-3 px-4 font-semibold text-white">{item.student.name}</td>
+                          <td className="py-3 px-4 text-center font-mono text-slate-300">
+                            {item.total > 0 ? `${item.present} / ${item.total}` : '-'}
+                          </td>
+                          <td className="py-3 px-4 text-center">
+                            {item.total > 0 ? (
+                              <span
+                                className={`px-2.5 py-1 rounded-full font-bold text-xs ${
+                                  isHigh
+                                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                    : isMedium
+                                    ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+                                    : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                                }`}
+                              >
+                                {item.rate}%
+                              </span>
+                            ) : (
+                              <span className="text-slate-500 text-xs italic">Tiada Sesi</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-4 text-center">
+                            {item.total === 0 ? (
+                              <span className="text-slate-500 text-xs">-</span>
+                            ) : item.rate >= 80 ? (
+                              <span
+                                className="inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-bold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shadow-sm"
+                                title="Lulus KPI (≥ 80%)"
+                              >
+                                ✅
+                              </span>
+                            ) : (() => {
+                              const waUrl = generateWhatsAppWarningLink({
+                                student: item.student,
+                                className: selectedClassSection,
+                                presentCount: item.present,
+                                totalSessions: item.total,
+                                rate: item.rate,
+                                courseCode: targetClassSessions[0]?.subjectCode,
+                                courseName: targetClassSessions[0]?.sessionName,
+                                lecturerName: targetClassSessions[0]?.lecturerName
+                              });
+
+                              return waUrl ? (
+                                <a
+                                  href={waUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center justify-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/40 hover:border-rose-400 shadow-sm hover:scale-105 transition-all cursor-pointer group"
+                                  title={`❌ Perlu Surat Amaran (< 80%). Klik untuk buka WhatsApp & hantar rekod amaran kehadiran rasmi kepada ${item.student.name} (${item.student.phone})`}
+                                >
+                                  <span>❌</span>
+                                  <span className="text-[10px] font-semibold text-rose-300 group-hover:text-white underline-offset-2 group-hover:underline">
+                                    WhatsApp
+                                  </span>
+                                </a>
+                              ) : (
+                                <span
+                                  className="inline-flex items-center justify-center px-2 py-0.5 rounded-full text-xs font-bold bg-rose-500/10 text-rose-400 border border-rose-500/20 shadow-sm"
+                                  title="Perlu Surat Amaran (< 80%) - No. telefon belum didaftarkan"
+                                >
+                                  ❌
+                                </span>
+                              );
+                            })()}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Controls */}
+            {selectedClassStudentStats.length > 0 && (
+              <div className="py-3 px-4 bg-slate-950/80 border-t border-slate-800 text-[11px] text-slate-400 flex flex-col sm:flex-row items-center justify-between gap-3">
+                <span>
+                  Menunjukkan{' '}
+                  <strong className="text-white font-mono">
+                    {(analysisPage - 1) * analysisPerPage + 1} -{' '}
+                    {Math.min(analysisPage * analysisPerPage, selectedClassStudentStats.length)}
+                  </strong>{' '}
+                  daripada <strong className="text-white font-mono">{selectedClassStudentStats.length}</strong> pelajar
+                </span>
+
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="text-slate-400 text-[11px]">Papar:</span>
+                    <div className="inline-flex rounded-lg bg-slate-900 p-0.5 border border-slate-800">
+                      {[10, 20, 50].map((size) => (
+                        <button
+                          key={size}
+                          type="button"
+                          onClick={() => {
+                            setAnalysisPerPage(size);
+                            setAnalysisPage(1);
+                          }}
+                          className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors cursor-pointer ${
+                            analysisPerPage === size
+                              ? 'bg-indigo-600 text-white shadow-sm'
+                              : 'text-slate-400 hover:text-white'
+                          }`}
+                        >
+                          {size}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {totalAnalysisPages > 1 && (
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        disabled={analysisPage === 1}
+                        onClick={() => setAnalysisPage((p) => Math.max(1, p - 1))}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-medium transition cursor-pointer border border-slate-700"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5" />
+                        <span className="hidden sm:inline">Sebelum</span>
+                      </button>
+
+                      <span className="px-2 font-mono text-slate-300">
+                        {analysisPage} / {totalAnalysisPages}
+                      </span>
+
+                      <button
+                        type="button"
+                        disabled={analysisPage === totalAnalysisPages}
+                        onClick={() => setAnalysisPage((p) => Math.min(totalAnalysisPages, p + 1))}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:hover:bg-slate-800 text-slate-300 hover:text-white text-xs font-medium transition cursor-pointer border border-slate-700"
+                      >
+                        <span className="hidden sm:inline">Seterusnya</span>
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* PERSPECTIVE 2: SESSION-CENTRIC */}
+      {reportPerspective === 'SESSION' && !currentSession && (
+        <div className="text-center py-16 bg-slate-900/60 rounded-2xl border border-slate-800 p-6 flex flex-col items-center justify-center space-y-3">
+          <BookOpen className="w-10 h-10 text-indigo-500/40" />
+          <div className="space-y-1">
+            <h4 className="text-sm font-bold text-white">Tiada Sesi Kuliah Direkodkan</h4>
+            <p className="text-xs text-slate-400 max-w-md">
+              Sistem kini bersih daripada data demo. Sila cipta subjek dan sesi kuliah di tab "Pengurusan Kelas" untuk mula merekod dan melihat laporan kehadiran.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {reportPerspective === 'SESSION' && currentSession && (
+        <div className="space-y-6 printable-report-container">
+          {/* Summary KPIs & Set Chart */}
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            {/* KPI Box */}
+            <div className="rounded-2xl bg-slate-900/80 border border-slate-800 p-5 space-y-4">
+              <div className="flex items-start justify-between gap-2">
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {currentSession.subjectCode && (
+                      <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                        {currentSession.subjectCode}
+                      </span>
+                    )}
+                    {currentSession.className && (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-500/30 font-semibold">
+                        Kelas {currentSession.className}
+                      </span>
+                    )}
+                  </div>
+                  <h3 className="text-base font-bold text-white">
+                    {currentSession.sessionName}
+                  </h3>
+                  {currentSession.lecturerName && (
+                    <div className="text-xs text-slate-400 flex items-center gap-1">
+                      <UserCheck className="w-3 h-3 text-indigo-400" />
+                      <span>Pensyarah: <strong className="text-slate-200">{currentSession.lecturerName}</strong></span>
+                    </div>
+                  )}
+                </div>
+                <div className="text-right shrink-0">
+                  <div className="text-2xl font-black text-emerald-400">{sessionPercent}%</div>
+                  <div className="text-[10px] text-slate-400">Kehadiran</div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-3 gap-2 pt-2 text-center">
+                <div className="p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <div className="text-base font-bold text-white">{presentCount}</div>
+                  <div className="text-[10px] text-emerald-400 font-semibold">Hadir</div>
+                </div>
+                <div className="p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <div className="text-base font-bold text-white">{absentCount}</div>
+                  <div className="text-[10px] text-rose-400 font-semibold">Tidak Hadir</div>
+                </div>
+                <div className="p-2.5 rounded-xl bg-slate-950/60 border border-slate-800">
+                  <div className="text-base font-bold text-white">{totalTargetCount}</div>
+                  <div className="text-[10px] text-slate-400 font-semibold">Sasaran</div>
+                </div>
+              </div>
+
+              <div className="text-xs text-slate-400 space-y-1 pt-1 border-t border-slate-800/80">
+                <div>🕒 Masa & Tarikh: <strong className="text-slate-300">{currentSession.date} {currentSession.startTime ? `(${currentSession.startTime} - ${currentSession.endTime})` : ''}</strong></div>
+              </div>
+            </div>
+
+            {/* Set Comparison Bar Chart */}
+            <div className="lg:col-span-2 rounded-2xl bg-slate-900/80 border border-slate-800 p-5 space-y-2">
+              <h3 className="text-sm font-bold text-white">Analitik Kehadiran Mengikut Kelas (%)</h3>
+              <div className="h-44 w-full pt-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={setPerformanceData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#334155" vertical={false} />
+                    <XAxis dataKey="name" stroke="#94a3b8" fontSize={11} />
+                    <YAxis stroke="#94a3b8" fontSize={11} domain={[0, 100]} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#0f172a', borderColor: '#334155', borderRadius: '8px', fontSize: '12px' }}
+                    />
+                    <Bar dataKey="Peratus" radius={[6, 6, 0, 0]}>
+                      {setPerformanceData.map((entry, index) => (
+                        <Cell key={`cell-${index}`} fill={entry.Peratus >= 80 ? '#10b981' : entry.Peratus >= 50 ? '#6366f1' : '#f59e0b'} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
+          {/* TABLE OF STUDENTS FOR THIS SESSION */}
+          <div className="rounded-2xl bg-slate-900/80 border border-slate-800 overflow-hidden shadow-lg">
+            <div className="p-4 bg-slate-900 border-b border-slate-800 flex items-center justify-between">
+              <div className="text-xs font-bold text-white">
+                Lembaran Kehadiran Kelas ({filteredSessionStudents.length} Pelajar)
+              </div>
+              <span className="text-[11px] text-slate-400">
+                KPM Bandar Penawar
+              </span>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs text-slate-300">
+                <thead className="bg-slate-950 text-slate-400 uppercase text-[10px] font-bold tracking-wider border-b border-slate-800">
+                  <tr>
+                    <th className="py-3 px-4">Bil</th>
+                    <th className="py-3 px-4">No. Pelajar</th>
+                    <th className="py-3 px-4">Nama Penuh Pelajar</th>
+                    <th className="py-3 px-4">Kelas</th>
+                    <th className="py-3 px-4">Status Kehadiran</th>
+                    <th className="py-3 px-4">Masa Imbasan</th>
+                    <th className="py-3 px-4">Kaedah</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60">
+                  {filteredSessionStudents.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-8 text-center text-slate-500">
+                        Tiada pelajar ditemui mengikut tapisan semasa.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredSessionStudents.map((st, idx) => {
+                      const rec = recordMap.get(st.id);
+                      const isPresent = rec?.status === 'PRESENT';
+
+                      return (
+                        <tr key={st.id} className="hover:bg-slate-800/40 transition-colors">
+                          <td className="py-3 px-4 text-slate-500 font-mono">{idx + 1}</td>
+                          <td className="py-3 px-4 font-mono font-bold text-indigo-400">{st.studentId}</td>
+                          <td className="py-3 px-4 font-semibold text-white">{st.name}</td>
+                          <td className="py-3 px-4">
+                            <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${getClassBadgeColor(st.className)}`}>
+                              {st.className}
+                            </span>
+                          </td>
+                          <td className="py-3 px-4">
+                            {isPresent ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-bold border border-emerald-500/40">
+                                <CheckCircle2 className="w-3 h-3" />
+                                <span>HADIR</span>
+                              </span>
+                            ) : (() => {
+                              const sessionWaUrl = generateWhatsAppWarningLink({
+                                student: st,
+                                sessionName: currentSession.sessionName,
+                                sessionDate: currentSession.date,
+                                sessionTime: currentSession.startTime ? `${currentSession.startTime} - ${currentSession.endTime}` : undefined,
+                                courseCode: currentSession.subjectCode,
+                                courseName: currentSession.sessionName,
+                                className: currentSession.className || st.className,
+                                lecturerName: currentSession.lecturerName
+                              });
+
+                              return sessionWaUrl ? (
+                                <a
+                                  href={sessionWaUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 hover:border-rose-400 text-[10px] font-bold transition-all cursor-pointer group"
+                                  title={`Tidak Hadir Sesi Ini. Klik untuk hubungi ${st.name} via WhatsApp (${st.phone})`}
+                                >
+                                  <XCircle className="w-3 h-3 text-rose-400" />
+                                  <span>TIDAK HADIR</span>
+                                  <span className="text-[9px] px-1 rounded bg-rose-950/80 text-rose-300 group-hover:text-white underline-offset-2 group-hover:underline">
+                                    WhatsApp
+                                  </span>
+                                </a>
+                              ) : (
+                                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-400 text-[10px] font-semibold border border-rose-500/30">
+                                  <XCircle className="w-3 h-3" />
+                                  <span>TIDAK HADIR</span>
+                                </span>
+                              );
+                            })()}
+                          </td>
+                          <td className="py-3 px-4 font-mono text-slate-400 text-[11px]">
+                            {rec ? new Date(rec.timestamp).toLocaleTimeString('ms-MY') : '-'}
+                          </td>
+                          <td className="py-3 px-4 text-[10px] uppercase text-slate-500">
+                            {rec ? rec.method : '-'}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+
+      {/* Toast Notification */}
+      {backupToast && (
+        <div className="fixed bottom-6 right-6 z-50 bg-emerald-950 border-2 border-emerald-500/60 text-emerald-200 px-5 py-3.5 rounded-2xl shadow-2xl flex items-center gap-3 animate-fadeIn">
+          <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          <span className="text-xs font-bold">{backupToast}</span>
+        </div>
+      )}
+    </div>
+  );
+};

@@ -1,0 +1,291 @@
+export type EventStatus = 'OPEN' | 'CLOSED' | 'ARCHIVED';
+
+export type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'LATE' | 'EXCUSED';
+
+export type AttendanceMethod = 'QR' | 'MANUAL' | 'CAMERA_SCAN' | 'SIMULATOR' | 'MANUAL_OVERRIDE';
+
+export type UserRole = 'ADMIN' | 'LECTURER' | 'STUDENT';
+
+
+export type ActivityCategory =
+  | 'CLASS'
+  | 'ASSEMBLY'
+  | 'OFFICIAL_PROGRAMME'
+  | 'SEMINAR'
+  | 'WORKSHOP'
+  | 'BRIEFING'
+  | 'CO_CURRICULAR'
+  | 'STUDENT_PROGRAMME'
+  | 'CLUB_ACTIVITY'
+  | 'SPECIAL_EVENT'
+  | 'OTHER';
+
+export interface Lecturer {
+  id: string;
+  name: string;
+  email: string; // Must end with @mara.gov.my
+  icNumber?: string; // Optional (e.g. 861115-46-5305)
+  pin: string; // 4-digit PIN (default '1234')
+  mustChangePin?: boolean;
+  pinChangedAt?: string;
+  phone?: string;
+  department?: string;
+  assignedSections?: string[]; // e.g. ['DIA_4A', 'DIA_4B']
+  assignedClasses?: string[]; // Alias for assignedSections
+  assignedSubjects?: string[]; // e.g. ['MPU 2163 - Pengajian Malaysia 2']
+  role?: 'ADMIN' | 'LECTURER';
+  status?: 'PENDING' | 'ACTIVE' | 'REJECTED';
+  registeredAt?: string;
+  approvedAt?: string;
+  approvedBy?: string;
+}
+
+export interface TeachingAssignment {
+  id: string; // e.g. TA_${lecturerId}_${subjectCode}_${className}
+  lecturerId: string;
+  lecturerEmail: string;
+  lecturerName: string;
+  subjectId: string;
+  subjectCode: string;
+  subjectName: string;
+  className: string; // e.g. DIA_4A
+  status: 'PENDING' | 'ACTIVE' | 'REJECTED';
+  createdAt: string; // ISO String
+  approvedAt?: string;
+  approvedBy?: string;
+}
+
+export interface Subject {
+  id: string;
+  code: string; // e.g. MPU 2163
+  name: string; // e.g. Pengajian Malaysia 2
+  lecturerId?: string;
+  lecturerEmail?: string;
+  lecturerName?: string;
+  department?: string;
+  sections: string[]; // e.g. ['DIA_4A', 'DIA_4B']
+  location?: string;
+  description?: string;
+  status?: 'ACTIVE' | 'ARCHIVED';
+  createdAt?: string;
+}
+
+export interface Enrollment {
+  id: string; // e.g. ENR_${studentId}_${subjectCode}_${className}
+  studentId: string; // Unique student identifier (No. Pelajar e.g. PDA-2502-011)
+  subjectCode: string; // e.g. MPU 2163
+  subjectName?: string; // e.g. Pengajian Malaysia 2
+  className: string; // e.g. DIA_4A
+  section?: string;
+  lecturerEmail?: string;
+  lecturerName?: string;
+  enrolledAt: string; // ISO String
+  status?: 'ACTIVE' | 'DROPPED';
+}
+
+export interface EnrollmentContext {
+  subjectCode: string;
+  subjectName: string;
+  className: string;
+  lecturerName?: string;
+  lecturerEmail?: string;
+}
+
+export interface Student {
+  id: string; // Unique student identifier (e.g. PDA-2502-005)
+  studentId: string; // Normalized No_Pelajar (e.g. PDA-2502-005)
+  name: string;
+  className: string; // e.g. DIA_4A, DIA_4B, DIA_4C, DIA_4D
+  classId?: string;
+  email: string;
+  phone: string;
+  avatarUrl?: string;
+  department?: string; // Programme (e.g. Diploma Perakaunan)
+}
+
+export interface AttendanceSession {
+  id: string; // Unique session ID (e.g. SES-CLS-01)
+  sessionName: string; // e.g. "Sesi 1: Pengenalan Perakaunan" / "Tutorial Bab 2"
+  subjectId?: string;
+  subjectCode: string; // e.g. "MPU 2163" or "ACC 2103"
+  subjectName: string; // e.g. "Pengajian Malaysia 2"
+  className: string; // e.g. "DIA_4A" or "DIA_4B" or "ALL"
+  section?: string;
+  teachingAssignmentId?: string; // Authoritative teaching assignment ID binding (SES v4.5)
+  lecturerName: string; // e.g. "Khairi bin Abdul Rahman"
+  lecturerEmail?: string; // e.g. "khairi@mara.gov.my"
+  lecturerId?: string;
+  date: string; // YYYY-MM-DD
+  startTime: string; // HH:mm
+  endTime: string; // HH:mm
+  status: EventStatus; // OPEN | CLOSED | ARCHIVED
+  attendanceMethod: AttendanceMethod;
+  qrToken?: string;
+  location?: string; // e.g. "Bilik Kuliah 3" / "Makmal Komputer"
+  topic?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  targetCount?: number;
+  actualCount?: number;
+  
+  // Backward compatibility fields
+  activityId?: string;
+  activityName?: string;
+  category?: string;
+  organizer?: string;
+}
+
+export interface AttendanceRecord {
+  id: string; // Record ID (e.g. REC-172354890)
+  sessionId: string; // Associated Session ID
+  studentId: string; // Associated Student ID (No_Pelajar)
+  studentName?: string; // Cached or denormalized student name for offline/audit view
+  timestamp: string; // ISO String
+  status: AttendanceStatus; // PRESENT, ABSENT, etc.
+  method: AttendanceMethod;
+  notes?: string;
+  verifiedBy?: string;
+  subjectCode?: string;
+  className?: string;
+}
+
+export interface ScanResult {
+  code:
+    | 'RECORDED'
+    | 'ALREADY_RECORDED'
+    | 'INVALID_QR'
+    | 'NO_ACTIVE_EVENT'
+    | 'SESSION_CLOSED'
+    | 'UNAUTHORIZED_LECTURER'
+    | 'STUDENT_NOT_FOUND'
+    | 'CLASS_MISMATCH'
+    | 'ERROR';
+  message: string;
+  student?: Student;
+  session?: AttendanceSession;
+  timestamp: string;
+  isDuplicate?: boolean;
+  record?: AttendanceRecord;
+  success: boolean;
+}
+
+export type ActiveTab =
+  | 'dashboard'
+  | 'scanner'
+  | 'classes'
+  | 'activities'
+  | 'students'
+  | 'my-attendance'
+  | 'reports'
+  | 'guide'
+  | 'support';
+
+export type AccessState = 'ACCESS_REQUIRED' | 'ACCESS_GRANTED' | 'ACCESS_EXPIRED';
+
+export interface TrustedSession {
+  type: 'ADMIN' | 'LECTURER';
+  lecturerId: string;
+  email: string;
+  name: string;
+  role: 'ADMIN' | 'LECTURER';
+  token: string;
+  issuedAt: number;
+  expiresAt: number;
+}
+
+export interface StudentAttendanceSummary {
+  student: Student;
+  totalSessions: number;
+  presentCount: number;
+  absentCount: number;
+  percentage: number;
+  subjectBreakdown: Record<string, { total: number; present: number; percentage: number }>;
+  recentRecords: Array<{
+    record: AttendanceRecord;
+    session: AttendanceSession;
+  }>;
+}
+
+export type AuditCategory =
+  | 'CSV_IMPORT'
+  | 'SESSION_MGMT'
+  | 'LECTURER_STATUS'
+  | 'STUDENT_MGMT'
+  | 'MASTER_DATA'
+  | 'SECURITY_AUTH'
+  | 'ATTENDANCE_OVERRIDE';
+
+export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL' | 'SUCCESS';
+
+export interface AuditLogItem {
+  id: string;
+  timestamp: string; // ISO String
+  category: AuditCategory;
+  action: string; // e.g. "Import Pelajar (CSV)", "Padam Sesi Kuliah", "Kelulusan Pensyarah"
+  details: string; // Detailed description of the event
+  performedBy: string; // e.g. "Ts. Dr. Ahmad (Admin)", "Sistem"
+  target?: string; // e.g. "MPU 2163", "DIA_4A", "ahmad@mara.gov.my"
+  metadata?: Record<string, any>;
+  severity: AuditSeverity;
+}
+
+/**
+ * Official ClassAttend App Icon — Single Source of Truth
+ */
+export const OFFICIAL_STUDENT_ATTEND_ICON =
+  'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/android-chrome-192x192.png';
+
+/**
+ * Official ClassAttend Open Graph Image (OGI) — Single Source of Truth
+ */
+export const OFFICIAL_STUDENT_ATTEND_OGI =
+  'https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/OGI%20ClassAttend.jpg';
+
+// ======================== SES v4.5 TRUSTED AUTH TYPES ========================
+
+export type TrustedRole = 'SUPER_ADMIN' | 'ADMIN' | 'LECTURER' | 'STUDENT' | 'KIOSK' | 'ANONYMOUS' | 'UNAUTHENTICATED';
+
+export interface TrustedClaims {
+  role: TrustedRole;
+  institutionalId: string;
+  assignedClasses?: string[];
+  kioskId?: string;
+}
+
+export interface TrustedIdentity {
+  uid: string;
+  email: string | null;
+  isAuthenticated: boolean;
+  role: TrustedRole;
+  institutionalId: string | null;
+  claims: TrustedClaims | null;
+  isAnonymous: boolean;
+}
+
+// ======================== PORTAL COMPONENT COMPATIBILITY EXPORTS ========================
+
+export type {
+  UserSession,
+  AuthStatus,
+  NavigationTab,
+  OperationalPhase,
+  ContentStatus,
+  AnnouncementPriority,
+  EventCategory,
+  AIImageAnalysisResult,
+  Announcement,
+  BatchUploadItem,
+  ScheduleItem,
+  DocumentType,
+  DocumentItem,
+  EventSectionType,
+  EventSectionItem,
+  EventSection,
+  LocationCategory,
+  LocationItem,
+  PortalSettings,
+  PortalData,
+} from './types/index';
+
+
+

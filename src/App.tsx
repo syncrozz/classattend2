@@ -1,0 +1,1371 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import {
+  ActiveTab,
+  Student,
+  Subject,
+  Lecturer,
+  AttendanceSession,
+  AttendanceRecord,
+  EventStatus,
+  ScanResult,
+  AttendanceMethod,
+  UserRole,
+  Enrollment,
+  EnrollmentContext,
+  TeachingAssignment
+} from './types';
+import { isLecturerAuthorizedForSession } from './utils/sessionAuth';
+import { attendanceEngine } from './services/attendanceEngine';
+import { soundService } from './services/soundService';
+
+import { Header } from './components/Header';
+import { SidebarNav } from './components/SidebarNav';
+import { DashboardView } from './components/DashboardView';
+import { AdminControlCenterView } from './components/AdminControlCenterView';
+import { LecturerWorkspaceView } from './components/LecturerWorkspaceView';
+import { FirstTimeLecturerModal } from './components/FirstTimeLecturerModal';
+import { ScannerView } from './components/ScannerView';
+import { EventManagementView } from './components/EventManagementView';
+import { StaffDirectoryView } from './components/StaffDirectoryView';
+import { MyAttendanceView } from './components/MyAttendanceView';
+import { ReportsView } from './components/ReportsView';
+import { ConceptGuideView } from './components/ConceptGuideView';
+import { SupportInnovationView } from './components/SupportInnovationView';
+import { Footer } from './components/Footer';
+import { AdminPinModal } from './components/AdminPinModal';
+import { CSVImportModal } from './components/CSVImportModal';
+import { PWAInstallModal } from './components/PWAInstallModal';
+import { StudentSelfRegistrationModal } from './components/StudentSelfRegistrationModal';
+import { LecturerSelfRegistrationModal } from './components/LecturerSelfRegistrationModal';
+import { ForceChangePasswordModal } from './components/ForceChangePasswordModal';
+import { StudentCheckinModal, StudentCheckinContext } from './components/StudentCheckinModal';
+import { StudentQrPortalView } from './components/StudentQrPortalView';
+import { accessManager } from './services/accessManager';
+import { auditLogger } from './services/auditLogger';
+import { subscribeQuotaStatus, resetQuotaStatus } from './services/firebase';
+import { LECTURER_EMAIL_DOMAIN } from './utils/staffUtils';
+import { AlertCircle, X, CheckCircle2 } from 'lucide-react';
+
+export default function App() {
+  const checkIsQrRoute = (): boolean => {
+    if (typeof window === 'undefined') return false;
+    const path = window.location.pathname.toLowerCase();
+    const hash = window.location.hash.toLowerCase();
+    return (
+      path === '/qr' ||
+      path === '/qr/' ||
+      path.startsWith('/qr') ||
+      hash === '#qr' ||
+      hash === '#/qr' ||
+      hash.startsWith('#qr') ||
+      hash.startsWith('#/qr')
+    );
+  };
+
+  const [isQrRoute, setIsQrRoute] = useState<boolean>(checkIsQrRoute);
+
+  const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
+    if (typeof window !== 'undefined') {
+      if (window.location.hash === '#support') {
+        return 'support';
+      }
+      const savedTab = localStorage.getItem('classattend_active_tab') as ActiveTab | null;
+      if (savedTab && ['dashboard', 'scanner', 'activities', 'classes', 'students', 'reports', 'guide', 'support'].includes(savedTab)) {
+        return savedTab;
+      }
+    }
+    return 'dashboard';
+  });
+  
+  // Access Management & Roles
+  const [accessState, setAccessState] = useState(() => accessManager.getAccessState());
+  const [currentRole, setCurrentRole] = useState<UserRole>(() => {
+    const acc = accessManager.getAccessState();
+    return acc.session ? acc.role : 'STUDENT';
+  });
+  const [isFirstTimeLecturerModalOpen, setIsFirstTimeLecturerModalOpen] = useState<boolean>(false);
+
+  // Real-time state from Attendance Engine
+  const [students, setStudents] = useState<Student[]>(() => attendanceEngine.getStudents());
+  const [subjects, setSubjects] = useState<Subject[]>(() => attendanceEngine.getSubjects());
+  const [lecturers, setLecturers] = useState<Lecturer[]>(() => attendanceEngine.getLecturers());
+  const [teachingAssignments, setTeachingAssignments] = useState<TeachingAssignment[]>(() => attendanceEngine.getTeachingAssignments());
+  const [enrollments, setEnrollments] = useState<Enrollment[]>(() => attendanceEngine.getEnrollments());
+  const [activeLecturer, setActiveLecturer] = useState<Lecturer | null>(() => {
+    const acc = accessManager.getAccessState();
+    return acc.session ? (acc.lecturer || attendanceEngine.getActiveLecturer()) : null;
+  });
+  const [sessions, setSessions] = useState<AttendanceSession[]>(() => attendanceEngine.getSessions());
+  const [attendanceRecords, setAttendanceRecords] = useState<AttendanceRecord[]>(() => attendanceEngine.getAttendanceRecords());
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [migrationNotice, setMigrationNotice] = useState<string | null>(() => {
+    if (typeof window !== 'undefined') {
+      const notice = localStorage.getItem('classattend_migration_notice');
+      if (notice) {
+        localStorage.removeItem('classattend_migration_notice');
+        return notice;
+      }
+    }
+    return null;
+  });
+
+  // Student Check-In Modal & Context (From QR Scan / Link / Hash)
+  const [isStudentCheckinOpen, setIsStudentCheckinOpen] = useState<boolean>(false);
+  const [studentCheckinContext, setStudentCheckinContext] = useState<StudentCheckinContext | null>(null);
+
+  // Student Self Registration Modal & Context
+  const [isSelfRegistrationOpen, setIsSelfRegistrationOpen] = useState<boolean>(false);
+  const [selfRegistrationContext, setSelfRegistrationContext] = useState<EnrollmentContext | null>(null);
+
+  // Lecturer Self Registration Modal (From QR / Link)
+  const [isLecturerSelfRegOpen, setIsLecturerSelfRegOpen] = useState<boolean>(() => {
+    if (typeof window !== 'undefined' && window.location.hash.startsWith('#lecturer-register')) {
+      return true;
+    }
+    return false;
+  });
+
+  // Helper to parse URL hash (#enroll, #attend, #lecturer-register, #support)
+  const parseHashRouting = () => {
+    if (typeof window === 'undefined') return;
+    const hash = window.location.hash;
+    if (hash.startsWith('#enroll')) {
+      const queryString = hash.includes('?') ? hash.substring(hash.indexOf('?') + 1) : '';
+      const params = new URLSearchParams(queryString);
+      const subjectCode = params.get('subject') || 'MPU 2163';
+      const subjectName = params.get('subjectName') || 'Pengajian Malaysia 2';
+      const className = params.get('class') || 'DIA_4A';
+      const lecturerName = params.get('lecturer') || undefined;
+      const lecturerEmail = params.get('lecturerEmail') || undefined;
+
+      setSelfRegistrationContext({
+        subjectCode,
+        subjectName,
+        className,
+        lecturerName,
+        lecturerEmail
+      });
+      setIsSelfRegistrationOpen(true);
+    } else if (hash.startsWith('#lecturer-register')) {
+      setIsLecturerSelfRegOpen(true);
+    } else if (hash.startsWith('#attend')) {
+      const queryString = hash.includes('?') ? hash.substring(hash.indexOf('?') + 1) : '';
+      const params = new URLSearchParams(queryString);
+      const sessionId = params.get('session') || '';
+      const subjectCode = params.get('subject') || '';
+      const subjectName = params.get('subjectName') || undefined;
+      const className = params.get('class') || 'DIA_4A';
+      const lecturerName = params.get('lecturer') || undefined;
+      const date = params.get('date') || undefined;
+
+      setStudentCheckinContext({
+        sessionId,
+        subjectCode,
+        subjectName,
+        className,
+        lecturerName,
+        date
+      });
+      setIsStudentCheckinOpen(true);
+    } else if (hash === '#support') {
+      setActiveTab('support');
+    }
+  };
+
+  useEffect(() => {
+    parseHashRouting();
+  }, []);
+
+  // Admin Mode & Modal States
+  const [isAdmin, setIsAdmin] = useState<boolean>(() => {
+    const acc = accessManager.getAccessState();
+    return Boolean(acc.session && acc.role === 'ADMIN');
+  });
+  const [isAdminPinModalOpen, setIsAdminPinModalOpen] = useState<boolean>(false);
+  const [adminActionTitle, setAdminActionTitle] = useState<string>('Pengesahan Identiti');
+  const [isCSVModalOpen, setIsCSVModalOpen] = useState<boolean>(false);
+  const [csvImportInitialMode, setCsvImportInitialMode] = useState<'STUDENT' | 'LECTURER'>('STUDENT');
+
+  // PWA Installation state
+  const [deferredPrompt, setDeferredPrompt] = useState<any>(null);
+  const [isPWAInstallModalOpen, setIsPWAInstallModalOpen] = useState<boolean>(false);
+
+  // Cloud Firestore Sync & Quota State
+  const [isSyncingCloud, setIsSyncingCloud] = useState<boolean>(false);
+  const [syncToastMessage, setSyncToastMessage] = useState<string | null>(null);
+  const [isQuotaExceeded, setIsQuotaExceeded] = useState<boolean>(false);
+  const [isQuotaBannerDismissed, setIsQuotaBannerDismissed] = useState<boolean>(false);
+
+  useEffect(() => {
+    const unsubQuota = subscribeQuotaStatus((exceeded) => {
+      setIsQuotaExceeded(exceeded);
+    });
+    return () => unsubQuota();
+  }, []);
+
+  const handleForceSyncCloud = async () => {
+    setIsSyncingCloud(true);
+    try {
+      const counts = await attendanceEngine.forceSyncFromFirestore();
+      soundService.playSuccess();
+      setSyncToastMessage(
+        `Berjaya disegerak terus dari Cloud Firestore: ${counts.students} Pelajar, ${counts.lecturers} Pensyarah, ${counts.subjects} Kursus, ${counts.sessions} Sesi.`
+      );
+      setTimeout(() => setSyncToastMessage(null), 6000);
+    } catch (err: any) {
+      console.warn('Sync notice:', err?.message || err);
+      const isQuota = err?.message?.toLowerCase().includes('quota') || err?.message?.toLowerCase().includes('had kuota');
+      setSyncToastMessage(
+        isQuota
+          ? 'Had kuota bacaan percuma Firestore telah dicapai untuk hari ini. Sistem beroperasi secara lancar dalam mod luar talian (LocalStorage).'
+          : 'Ralat semasa menyegerak dengan Firestore. Sila periksa sambungan internet.'
+      );
+      setTimeout(() => setSyncToastMessage(null), 6000);
+    } finally {
+      setIsSyncingCloud(false);
+    }
+  };
+
+  useEffect(() => {
+    const handleBeforeInstallPrompt = (e: Event) => {
+      e.preventDefault();
+      setDeferredPrompt(e);
+    };
+
+    const handleAppInstalled = () => {
+      setDeferredPrompt(null);
+      setIsPWAInstallModalOpen(false);
+    };
+
+    window.addEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+    window.addEventListener('appinstalled', handleAppInstalled);
+
+    const handleLocationChange = () => {
+      setIsQrRoute(checkIsQrRoute());
+      parseHashRouting();
+    };
+
+    window.addEventListener('hashchange', handleLocationChange);
+    window.addEventListener('popstate', handleLocationChange);
+
+    return () => {
+      window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt);
+      window.removeEventListener('appinstalled', handleAppInstalled);
+      window.removeEventListener('hashchange', handleLocationChange);
+      window.removeEventListener('popstate', handleLocationChange);
+    };
+  }, []);
+
+  // Subscribe to real-time engine changes
+  useEffect(() => {
+    const unsubStudents = attendanceEngine.subscribeStudents((data) => setStudents(data));
+    const unsubSubjects = attendanceEngine.subscribeSubjects((data) => setSubjects(data));
+    const unsubLecturers = attendanceEngine.subscribeLecturers((data) => setLecturers(data));
+    const unsubAssignments = attendanceEngine.subscribeTeachingAssignments((data) => setTeachingAssignments(data));
+    const unsubEnrollments = attendanceEngine.subscribeEnrollments((data) => setEnrollments(data));
+    const unsubSessions = attendanceEngine.subscribeSessions((data) => setSessions(data));
+    const unsubRecords = attendanceEngine.subscribeRecords((data) => setAttendanceRecords(data));
+
+    // Update active lecturer and permissions from access manager and engine
+    const acc = accessManager.getAccessState();
+    if (acc.session) {
+      const currentActive = attendanceEngine.getActiveLecturer() || acc.lecturer;
+      setActiveLecturer(currentActive);
+      setIsAdmin(acc.role === 'ADMIN');
+      setCurrentRole(acc.role);
+    } else {
+      setActiveLecturer(null);
+      setIsAdmin(false);
+      setCurrentRole('STUDENT');
+    }
+
+    return () => {
+      unsubStudents();
+      unsubSubjects();
+      unsubLecturers();
+      unsubAssignments();
+      unsubEnrollments();
+      unsubSessions();
+      unsubRecords();
+    };
+  }, []);
+
+  const [selectedScannerSessionId, setSelectedScannerSessionId] = useState<string | null>(null);
+
+  // Clear selectedScannerSessionId if the selected session is no longer OPEN
+  useEffect(() => {
+    if (selectedScannerSessionId) {
+      const ses = sessions.find((s) => s.id === selectedScannerSessionId);
+      if (!ses || ses.status !== 'OPEN') {
+        setSelectedScannerSessionId(null);
+      }
+    }
+  }, [sessions, selectedScannerSessionId]);
+
+  // Guard against non-lecturer tabs when role is LECTURER
+  useEffect(() => {
+    if (currentRole === 'LECTURER' && (activeTab === 'students' || activeTab === 'my-attendance')) {
+      setActiveTab('dashboard');
+    }
+  }, [currentRole, activeTab]);
+
+  // Scoped active session calculation:
+  // If user is LECTURER, strictly scope active session to authorized assignments / identity
+  // If user is ADMIN or general, open sessions across institution are visible
+  const activeSession = useMemo(() => {
+    if (currentRole === 'LECTURER' && activeLecturer) {
+      if (selectedScannerSessionId) {
+        const found = sessions.find(
+          (s) => s.id === selectedScannerSessionId && s.status === 'OPEN' && isLecturerAuthorizedForSession(s, activeLecturer, isAdmin, teachingAssignments)
+        );
+        if (found) return found;
+      }
+      return sessions.find(
+        (s) => s.status === 'OPEN' && isLecturerAuthorizedForSession(s, activeLecturer, isAdmin, teachingAssignments)
+      ) || null;
+    }
+
+    if (selectedScannerSessionId) {
+      const found = sessions.find((s) => s.id === selectedScannerSessionId && s.status === 'OPEN');
+      if (found) return found;
+    }
+    return sessions.find((s) => s.status === 'OPEN') || null;
+  }, [sessions, selectedScannerSessionId, currentRole, activeLecturer, isAdmin, teachingAssignments]);
+
+  // Toggle Admin / Lecturer Auth Mode
+  const handleToggleAdminMode = () => {
+    if (isAdmin || activeLecturer) {
+      setAdminActionTitle('Pengesahan Identiti');
+      setIsAdminPinModalOpen(true);
+    } else {
+      setAdminActionTitle('Pengesahan Identiti');
+      setIsAdminPinModalOpen(true);
+    }
+  };
+
+  // Logout Lecturer / Switch to Regular User Mode
+  const handleLogoutLecturer = () => {
+    attendanceEngine.logoutLecturer();
+    accessManager.clearTrustedAccess();
+    setAccessState(accessManager.getAccessState());
+    setActiveLecturer(null);
+    setIsAdmin(false);
+    setCurrentRole('STUDENT');
+    soundService.playClick();
+  };
+
+  // Approve Pending Lecturer Registration
+  const handleApproveLecturer = async (lecturerId: string) => {
+    const targetLec = lecturers.find((l) => l.id === lecturerId);
+    const result = await attendanceEngine.approveLecturer(lecturerId, activeLecturer?.name || 'Pentadbir Utama');
+    if (result.success) {
+      setLecturers(attendanceEngine.getLecturers());
+      setTeachingAssignments(attendanceEngine.getTeachingAssignments());
+      soundService.playSuccess();
+      auditLogger.log({
+        category: 'LECTURER_STATUS',
+        action: 'Kelulusan Pendaftaran Pensyarah',
+        details: `Permohonan pendaftaran pensyarah ${targetLec?.name || lecturerId} (${targetLec?.email || ''}) telah diluluskan dan diaktifkan.`,
+        performedBy: activeLecturer?.name || 'Pentadbir Utama',
+        target: targetLec?.name || lecturerId,
+        severity: 'SUCCESS'
+      });
+    }
+  };
+
+  // Reject Pending Lecturer Registration
+  const handleRejectLecturer = async (lecturerId: string) => {
+    const targetLec = lecturers.find((l) => l.id === lecturerId);
+    const result = await attendanceEngine.rejectLecturer(lecturerId, activeLecturer?.name || 'Pentadbir Utama');
+    if (result.success) {
+      setLecturers(attendanceEngine.getLecturers());
+      setTeachingAssignments(attendanceEngine.getTeachingAssignments());
+      soundService.playClick();
+      auditLogger.log({
+        category: 'LECTURER_STATUS',
+        action: 'Penolakan Pendaftaran Pensyarah',
+        details: `Permohonan pendaftaran pensyarah ${targetLec?.name || lecturerId} (${targetLec?.email || ''}) telah ditolak.`,
+        performedBy: activeLecturer?.name || 'Pentadbir Utama',
+        target: targetLec?.name || lecturerId,
+        severity: 'WARNING'
+      });
+    }
+  };
+
+  // Request Admin Access with Context
+  const handleRequestAdminAccess = (actionName?: string) => {
+    if (!isAdmin || !activeLecturer) {
+      setAdminActionTitle(actionName ? `Akses Diperlukan: ${actionName}` : 'Pengesahan Pensyarah Diperlukan');
+      setIsAdminPinModalOpen(true);
+    }
+  };
+
+  // Session Status Change (OPEN / CLOSED / ARCHIVED)
+  const handleSetSessionStatus = (sessionId: string, newStatus: EventStatus) => {
+    const session = sessions.find((s) => s.id === sessionId);
+    const updated = attendanceEngine.setSessionStatus(sessionId, newStatus);
+    setSessions(updated);
+    if (newStatus === 'CLOSED') {
+      soundService.playClick();
+    }
+    auditLogger.log({
+      category: 'SESSION_MGMT',
+      action: `Perubahan Status Sesi (${newStatus})`,
+      details: `Status sesi "${session?.sessionName || sessionId}" (${session?.subjectCode || ''} - ${session?.className || ''}) ditukar kepada ${newStatus}.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: session?.sessionName || sessionId,
+      severity: newStatus === 'CLOSED' ? 'INFO' : 'SUCCESS'
+    });
+  };
+
+  // Delete Session
+  const handleDeleteSession = (sessionId: string) => {
+    const sessionToDelete = sessions.find((s) => s.id === sessionId);
+    const updated = attendanceEngine.deleteSession(sessionId);
+    setSessions(updated);
+    setAttendanceRecords(attendanceEngine.getAttendanceRecords());
+    soundService.playClick();
+    auditLogger.log({
+      category: 'SESSION_MGMT',
+      action: 'Pemadaman Sesi Kuliah',
+      details: `Sesi "${sessionToDelete?.sessionName || sessionId}" bagi subjek ${sessionToDelete?.subjectCode || ''} (${sessionToDelete?.className || ''}) telah dipadamkan secara kekal.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: sessionToDelete?.sessionName || sessionId,
+      severity: 'WARNING'
+    });
+  };
+
+  // Create Subject
+  const handleCreateSubject = (newSubject: Subject) => {
+    attendanceEngine.addSubject(newSubject);
+    setSubjects(attendanceEngine.getSubjects());
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'MASTER_DATA',
+      action: 'Penambahan Subjek Kursus',
+      details: `Subjek baharu ${newSubject.code} - ${newSubject.name} (${newSubject.sections?.join(', ') || 'Semua Seksyen'}) berjaya didaftarkan.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: newSubject.code,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Update classes assigned to a subject
+  const handleUpdateSubjectClasses = (subjectCode: string, classNames: string[]) => {
+    const res = attendanceEngine.updateSubjectClasses(subjectCode, classNames, activeLecturer);
+    setSubjects(res.subjects);
+    setTeachingAssignments(res.teachingAssignments);
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'MASTER_DATA',
+      action: 'Kemaskini Senarai Kelas Subjek',
+      details: `Kelas bagi subjek ${subjectCode} telah dikemas kini kepada [${classNames.join(', ')}].`,
+      performedBy: activeLecturer?.name || 'Pensyarah',
+      target: subjectCode,
+      severity: 'INFO'
+    });
+  };
+
+
+  // Delete Subject
+  const handleDeleteSubject = (subjectId: string) => {
+    const subjectToDelete = subjects.find((s) => s.id === subjectId || s.code === subjectId);
+    attendanceEngine.deleteSubject(subjectId);
+    setSubjects(attendanceEngine.getSubjects());
+
+    // Also delete any sessions associated with this subject
+    const subjectSessions = sessions.filter(
+      (s) => s.subjectId === subjectId || s.activityId === subjectId || (subjectToDelete && s.subjectCode === subjectToDelete.code)
+    );
+    subjectSessions.forEach((s) => {
+      attendanceEngine.deleteSession(s.id);
+    });
+    setSessions(attendanceEngine.getSessions());
+
+    soundService.playClick();
+    auditLogger.log({
+      category: 'MASTER_DATA',
+      action: 'Pemadaman Subjek Kursus',
+      details: `Subjek ${subjectToDelete?.code || subjectId} - ${subjectToDelete?.name || ''} telah dipadamkan daripada kurikulum.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: subjectToDelete?.code || subjectId,
+      severity: 'WARNING'
+    });
+  };
+
+  // Create Session
+  const handleCreateSession = (session: AttendanceSession) => {
+    const updated = attendanceEngine.addSession(session);
+    setSessions(updated);
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'SESSION_MGMT',
+      action: 'Pembukaan Sesi Kuliah Baharu',
+      details: `Sesi kuliah "${session.sessionName}" bagi subjek ${session.subjectCode} (${session.className}) berjaya dibuka oleh ${session.lecturerName || 'Pensyarah'}.`,
+      performedBy: activeLecturer?.name || session.lecturerName || 'Pensyarah KPM',
+      target: session.sessionName,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Create Multiple Sessions (e.g. Meeting 1st 'a' & 2nd 'b' for each class automatically)
+  const handleCreateMultipleSessions = (newSessions: AttendanceSession[]) => {
+    if (!newSessions || newSessions.length === 0) return;
+    if (newSessions.length === 1) {
+      handleCreateSession(newSessions[0]);
+      return;
+    }
+    const updated = attendanceEngine.addMultipleSessions(newSessions);
+    setSessions(updated);
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'SESSION_MGMT',
+      action: 'Penjadualan Sesi Kuliah Berkelompok',
+      details: `${newSessions.length} sesi kuliah (${newSessions.map(s => `${s.sessionName} [${s.className}]`).join(', ')}) berjaya dijadualkan.`,
+      performedBy: activeLecturer?.name || 'Pensyarah KPM',
+      target: `${newSessions.length} Sesi Kuliah`,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Update Session (e.g. rename session title / remark like "Sesi 1" -> "Sesi 1a")
+  const handleUpdateSession = (updatedSession: AttendanceSession) => {
+    const updated = attendanceEngine.updateSession(updatedSession);
+    setSessions(updated);
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'SESSION_MGMT',
+      action: 'Kemaskini Tajuk / Remark Sesi Kuliah',
+      details: `Tajuk/remark sesi "${updatedSession.sessionName}" (${updatedSession.subjectCode || ''} - ${updatedSession.className || ''}) telah dikemas kini.`,
+      performedBy: activeLecturer?.name || updatedSession.lecturerName || 'Pensyarah KPM',
+      target: updatedSession.sessionName,
+      severity: 'INFO'
+    });
+  };
+
+  // Sprint 9: Seamless Start Attendance Session for Class
+  const handleStartSessionForClass = (subjectCode: string, subjectName: string, className: string) => {
+    // 1. Check if there's already an existing OPEN session for this subject and class
+    const existingOpen = sessions.find(
+      (s) =>
+        s.status === 'OPEN' &&
+        s.subjectCode?.toUpperCase() === subjectCode.toUpperCase() &&
+        (s.className?.toUpperCase() === className.toUpperCase() || s.className === 'ALL')
+    );
+
+    if (existingOpen) {
+      handleTabChange('scanner');
+      soundService.playSuccess();
+      return;
+    }
+
+    // 2. Check if there is an existing session today for this subject & class, reopen it
+    const todayStr = new Date().toISOString().split('T')[0];
+    const existingToday = sessions.find(
+      (s) =>
+        s.date === todayStr &&
+        s.subjectCode?.toUpperCase() === subjectCode.toUpperCase() &&
+        s.className?.toUpperCase() === className.toUpperCase()
+    );
+
+    if (existingToday) {
+      handleSetSessionStatus(existingToday.id, 'OPEN');
+      handleTabChange('scanner');
+      soundService.playSuccess();
+      return;
+    }
+
+    // 3. Otherwise create a fresh new session
+    const newSession: AttendanceSession = {
+      id: `SESS-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      sessionName: `Kuliah ${subjectCode} - ${className}`,
+      subjectCode: subjectCode,
+      subjectName: subjectName,
+      className: className,
+      date: todayStr,
+      startTime: new Date().toLocaleTimeString('ms-MY', { hour: '2-digit', minute: '2-digit' }),
+      endTime: '23:59',
+      status: 'OPEN',
+      attendanceMethod: 'QR',
+      location: 'Bilik Kuliah / Dewan',
+      lecturerName: activeLecturer?.name || 'PENSYARAH MARA',
+      lecturerEmail: activeLecturer?.email || `pensyarah${LECTURER_EMAIL_DOMAIN}`,
+      category: 'CLASS'
+    };
+
+    const updatedSessions = attendanceEngine.addSession(newSession);
+    setSessions(updatedSessions);
+    handleTabChange('scanner');
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'SESSION_MGMT',
+      action: 'Pelancaran Sesi Pantas Kelas',
+      details: `Sesi kehadiran "${newSession.sessionName}" dilancarkan untuk kelas ${className}.`,
+      performedBy: activeLecturer?.name || 'Pensyarah KPM',
+      target: newSession.sessionName,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Process Scan
+  const handleProcessScan = (
+    qrString: string,
+    method: AttendanceMethod = 'CAMERA_SCAN',
+    targetSessionId?: string
+  ): ScanResult => {
+    const result = attendanceEngine.processScan(qrString, method, targetSessionId);
+    setAttendanceRecords(attendanceEngine.getAttendanceRecords());
+    return result;
+  };
+
+  // Quick Simulator Scan
+  const handleQuickSimulateScan = (studentId: string): ScanResult => {
+    return handleProcessScan(`STUDENT|${studentId}`, 'SIMULATOR');
+  };
+
+  // Add Single Student
+  const handleAddStudent = (newStudent: Student) => {
+    attendanceEngine.addStudent(newStudent);
+    setStudents(attendanceEngine.getStudents());
+    auditLogger.log({
+      category: 'STUDENT_MGMT',
+      action: 'Pendaftaran Pelajar Individu',
+      details: `Pelajar ${newStudent.name} (${newStudent.studentId || newStudent.id}) telah didaftarkan ke dalam kelas ${newStudent.className}.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: newStudent.name,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Delete Student
+  const handleDeleteStudent = (studentId: string) => {
+    const studentToDelete = students.find((s) => s.id === studentId || s.studentId === studentId);
+    attendanceEngine.deleteStudent(studentId);
+    setStudents(attendanceEngine.getStudents());
+    auditLogger.log({
+      category: 'STUDENT_MGMT',
+      action: 'Pemadaman Rekod Pelajar',
+      details: `Rekod pelajar ${studentToDelete?.name || studentId} (${studentToDelete?.studentId || studentId}) telah dipadamkan.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: studentToDelete?.name || studentId,
+      severity: 'WARNING'
+    });
+  };
+
+  // Update / Edit Student
+  const handleUpdateStudent = (updatedStudent: Student) => {
+    attendanceEngine.updateStudent(updatedStudent);
+    setStudents(attendanceEngine.getStudents());
+    auditLogger.log({
+      category: 'STUDENT_MGMT',
+      action: 'Kemaskini Rekod Pelajar',
+      details: `Maklumat pelajar ${updatedStudent.name} (${updatedStudent.studentId || updatedStudent.id}) telah dikemaskini (Kelas: ${updatedStudent.className}).`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: updatedStudent.name,
+      severity: 'INFO'
+    });
+  };
+
+  // Import CSV Students
+  const handleImportStudents = async (newStudentsList: Student[], replaceAll: boolean = true) => {
+    let finalList: Student[] = [];
+
+    if (replaceAll) {
+      finalList = newStudentsList;
+    } else {
+      const existingMap = new Map<string, Student>(students.map((s) => [s.id, s]));
+      newStudentsList.forEach((s) => existingMap.set(s.id, s));
+      finalList = Array.from(existingMap.values());
+    }
+
+    await attendanceEngine.saveStudentsList(finalList, replaceAll);
+    setStudents(attendanceEngine.getStudents());
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'CSV_IMPORT',
+      action: replaceAll ? 'Import Pelajar CSV (Ganti Semua)' : 'Import Pelajar CSV (Gabung Rekod)',
+      details: `Berjaya memproses ${newStudentsList.length} rekod pelajar melalui import fail CSV. Jumlah pelajar terkini: ${finalList.length}. Mod: ${replaceAll ? 'Ganti Keseluruhan' : 'Gabung / Tambah'}.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: `${newStudentsList.length} Rekod Pelajar`,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Import CSV Lecturers
+  const handleImportLecturers = async (newLecturersList: Lecturer[]) => {
+    const result = await attendanceEngine.importLecturersWithAssignments(newLecturersList);
+    setLecturers(result.lecturers);
+    setSubjects(result.subjects);
+    setTeachingAssignments(result.assignments);
+
+    // If the activeLecturer is one of the imported lecturers, refresh their active profile
+    if (activeLecturer) {
+      const refreshedActive = result.lecturers.find(
+        (l) => l.email.toLowerCase() === activeLecturer.email.toLowerCase()
+      );
+      if (refreshedActive) {
+        setActiveLecturer(refreshedActive);
+        attendanceEngine.setActiveLecturer(refreshedActive);
+      }
+    }
+
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'CSV_IMPORT',
+      action: 'Import Direktori Pensyarah & Agihan Subjek (CSV)',
+      details: `Berjaya memuat naik ${newLecturersList.length} rekod pensyarah bersama agihan subjek & kelas automatik. Jumlah pensyarah terkini: ${result.lecturers.length}, Subjek berdaftar: ${result.subjects.length}.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: `${newLecturersList.length} Rekod Pensyarah`,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Update Lecturer Subject Assignments (Admin)
+  const handleUpdateLecturerAssignments = async (
+    lecturerId: string,
+    subjectAssignments: {
+      subjectCode: string;
+      subjectName: string;
+      department?: string;
+      classes: string[];
+    }[]
+  ) => {
+    const result = await attendanceEngine.setLecturerAssignments(lecturerId, subjectAssignments);
+    if (result.success) {
+      setLecturers(attendanceEngine.getLecturers());
+      setTeachingAssignments(attendanceEngine.getTeachingAssignments());
+      setSubjects(attendanceEngine.getSubjects());
+      soundService.playSuccess();
+      const targetLec = lecturers.find((l) => l.id === lecturerId);
+      auditLogger.log({
+        category: 'MASTER_DATA',
+        action: 'Penetapan Subjek Pensyarah',
+        details: `Admin telah menetapkan ${subjectAssignments.length} subjek pengajaran bagi pensyarah ${targetLec?.name || lecturerId}.`,
+        performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+        target: targetLec?.name || lecturerId,
+        severity: 'SUCCESS'
+      });
+    }
+    return result;
+  };
+
+  // Import CSV Subjects
+  const handleImportSubjects = (newSubjectsList: Subject[], replaceAll: boolean = false) => {
+    let finalList: Subject[] = [];
+    if (replaceAll) {
+      finalList = newSubjectsList;
+    } else {
+      const existingMap = new Map<string, Subject>(subjects.map((s) => [s.code.toUpperCase(), s]));
+      newSubjectsList.forEach((s) => existingMap.set(s.code.toUpperCase(), s));
+      finalList = Array.from(existingMap.values());
+    }
+
+    attendanceEngine.saveSubjectsList(finalList);
+    setSubjects(attendanceEngine.getSubjects());
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'CSV_IMPORT',
+      action: replaceAll ? 'Import Senarai Kursus CSV (Ganti Semua)' : 'Import Senarai Kursus CSV (Gabung Rekod)',
+      details: `Berjaya memproses ${newSubjectsList.length} kursus melalui fail CSV. Jumlah kursus tersenarai: ${finalList.length}.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: `${newSubjectsList.length} Rekod Kursus`,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Reset Subjects to default 46 KPM subjects
+  const handleResetSubjects = () => {
+    attendanceEngine.resetSubjectsToDefault();
+    setSubjects(attendanceEngine.getSubjects());
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'MASTER_DATA',
+      action: 'Reset Senarai Kursus KPM',
+      details: 'Senarai subjek telah diset semula kepada 46 kursus rasmi KPM.',
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: 'Senarai 46 Kursus KPM',
+      severity: 'INFO'
+    });
+  };
+
+  // Add Single Lecturer
+  const handleAddLecturer = (newLecturer: Lecturer) => {
+    const updated = [...lecturers.filter((l) => l.email.toLowerCase() !== newLecturer.email.toLowerCase()), newLecturer];
+    attendanceEngine.saveLecturersList(updated);
+    setLecturers(updated);
+    auditLogger.log({
+      category: 'LECTURER_STATUS',
+      action: 'Penambahan Pensyarah Baharu',
+      details: `Pensyarah ${newLecturer.name} (${newLecturer.email}) telah ditambah dengan status ${newLecturer.status || 'ACTIVE'}.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: newLecturer.name,
+      severity: 'SUCCESS'
+    });
+  };
+
+  // Delete Lecturer
+  const handleDeleteLecturer = (lecturerId: string) => {
+    const targetLec = lecturers.find((l) => l.id === lecturerId);
+    attendanceEngine.deleteLecturer(lecturerId);
+    setLecturers(attendanceEngine.getLecturers());
+    auditLogger.log({
+      category: 'LECTURER_STATUS',
+      action: 'Pemadaman Akaun Pensyarah',
+      details: `Akaun pensyarah ${targetLec?.name || lecturerId} (${targetLec?.email || ''}) telah dipadamkan.`,
+      performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+      target: targetLec?.name || lecturerId,
+      severity: 'WARNING'
+    });
+  };
+
+  // Select/Activate Lecturer
+  const handleSelectActiveLecturer = (lec: Lecturer) => {
+    attendanceEngine.setActiveLecturer(lec);
+    setActiveLecturer(lec);
+    const isLecAdmin = lec.role === 'ADMIN';
+    setIsAdmin(isLecAdmin);
+    setCurrentRole(isLecAdmin ? 'ADMIN' : 'LECTURER');
+    soundService.playSuccess();
+    auditLogger.log({
+      category: 'SECURITY_AUTH',
+      action: 'Sesi Aktif Pensyarah Ditukar',
+      details: `Sesi kerja aktif kini ditetapkan kepada ${lec.name} (${lec.department || 'KPM'}) - Peranan: ${isLecAdmin ? 'ADMIN' : 'LECTURER'}.`,
+      performedBy: lec.name,
+      target: lec.email,
+      severity: 'INFO'
+    });
+  };
+
+  // Reset Data to Default 95 Students
+  const handleResetData = () => {
+    if (window.confirm('Adakah anda pasti untuk mengeset semula data kepada Master 95 Pelajar asal?')) {
+      attendanceEngine.resetToDefaultData();
+      setStudents(attendanceEngine.getStudents());
+      setSubjects(attendanceEngine.getSubjects());
+      setLecturers(attendanceEngine.getLecturers());
+      setSessions(attendanceEngine.getSessions());
+      setAttendanceRecords(attendanceEngine.getAttendanceRecords());
+      setActiveLecturer(attendanceEngine.getActiveLecturer());
+      soundService.playSuccess();
+      auditLogger.log({
+        category: 'MASTER_DATA',
+        action: 'Reset Data Penuh Sistem',
+        details: 'Semua rekod pangkalan data telah diset semula kepada data master lalai (95 pelajar DIA dan kurikulum KPM).',
+        performedBy: activeLecturer?.name || 'Pentadbir Sistem',
+        target: 'Pangkalan Data Kolej',
+        severity: 'CRITICAL'
+      });
+    }
+  };
+
+
+  // Open Support Innovation Page (#support)
+  const handleOpenSupport = () => {
+    try {
+      window.location.hash = 'support';
+    } catch (e) {}
+    setActiveTab('support');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  // Return to Main Platform
+  const handleReturnToPlatform = () => {
+    try {
+      if (window.location.hash === '#support') {
+        history.pushState('', document.title, window.location.pathname + window.location.search);
+      }
+    } catch (e) {}
+    setActiveTab('dashboard');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleTabChange = (tab: ActiveTab) => {
+    if (tab !== 'support' && window.location.hash === '#support') {
+      try {
+        history.pushState('', document.title, window.location.pathname + window.location.search);
+      } catch (e) {}
+    }
+    setActiveTab(tab);
+    try {
+      localStorage.setItem('classattend_active_tab', tab);
+    } catch (e) {}
+  };
+
+  const handleOpenQrPortal = () => {
+    try {
+      window.location.hash = '#/qr';
+    } catch {
+      window.history.pushState(null, '', '/#/qr');
+    }
+    setIsQrRoute(true);
+  };
+
+  const handleReturnFromQr = () => {
+    try {
+      window.history.pushState(null, '', '/');
+    } catch {
+      window.location.hash = '';
+    }
+    setIsQrRoute(false);
+    setActiveTab('dashboard');
+  };
+
+  if (isQrRoute) {
+    return (
+      <StudentQrPortalView
+        students={students}
+        onReturnToMain={activeLecturer || isAdmin ? handleReturnFromQr : undefined}
+      />
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-indigo-500 selection:text-white">
+      {/* App Header */}
+      <Header
+        activeSession={activeSession}
+        activeLecturer={activeLecturer}
+        soundEnabled={soundEnabled}
+        isAdmin={isAdmin}
+        currentRole={currentRole}
+        onGoHome={handleReturnToPlatform}
+        onRoleChange={(role) => setCurrentRole(role)}
+        onToggleSound={(enabled) => setSoundEnabled(enabled)}
+        onOpenScanner={() => handleTabChange('scanner')}
+        onToggleAdminMode={handleToggleAdminMode}
+        onLogoutLecturer={handleLogoutLecturer}
+        onCloseActiveSession={(id) => handleSetSessionStatus(id, 'CLOSED')}
+        isLecturerWorkspaceActive={activeTab === 'dashboard' && currentRole === 'LECTURER' && Boolean(activeLecturer)}
+        onForceSyncCloud={handleForceSyncCloud}
+        isSyncingCloud={isSyncingCloud}
+      />
+
+      <div className="flex-1 max-w-7xl w-full mx-auto flex flex-col md:flex-row">
+        {/* Sidebar Nav */}
+        <SidebarNav
+          activeTab={activeTab}
+          onTabChange={handleTabChange}
+          activeSessionName={activeSession?.sessionName}
+          totalRecordsCount={attendanceRecords.length}
+          totalStudentsCount={students.length}
+          currentRole={currentRole}
+          onOpenPWAInstall={() => setIsPWAInstallModalOpen(true)}
+          onOpenQrPortal={handleOpenQrPortal}
+        />
+
+        {/* Main Content Body */}
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 overflow-y-auto">
+          {isQuotaExceeded && !isQuotaBannerDismissed && (
+            <div className="mb-4 p-4 rounded-2xl bg-gradient-to-r from-amber-500/20 via-orange-500/15 to-amber-500/20 border border-amber-500/40 text-amber-100 text-xs shadow-lg animate-in fade-in slide-in-from-top-2 duration-300">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="p-2 rounded-xl bg-amber-500/20 text-amber-400 shrink-0 mt-0.5">
+                    <AlertCircle className="w-5 h-5" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <p className="font-bold text-sm text-amber-300">
+                      Had Kuota Harian Percuma Firestore Telah Dicapai (Free Daily Read Units Exceeded)
+                    </p>
+                    <p className="text-amber-200/90 leading-relaxed">
+                      Pangkalan data Cloud Firestore telah mencapai had bacaan harian percuma. Sistem beroperasi sepenuhnya dalam <strong>mod luar talian (LocalStorage)</strong> tanpa gangguan atau kehilangan rekod kehadiran. Kuota percuma akan ditetapkan semula secara automatik esok.
+                    </p>
+                    <div className="pt-1 flex flex-wrap items-center gap-2">
+                      <a
+                        href="https://console.firebase.google.com/project/gen-lang-client-0739778545/firestore/databases/ai-studio-classattend-8378814f-0aae-4f9a-99ea-468f3503ec55/data?openUpgradeDialog=true"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500/30 hover:bg-amber-500/40 text-amber-200 font-semibold border border-amber-500/50 transition-colors shadow-sm"
+                      >
+                        Urus Pelan & Kuota di Konsol Firebase →
+                      </a>
+                      <a
+                        href="https://firebase.google.com/pricing#cloud-firestore"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800/80 hover:bg-slate-800 text-slate-300 font-medium border border-slate-700 transition-colors"
+                      >
+                        Maklumat Had Pelan Spark / Enterprise
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          resetQuotaStatus();
+                          handleForceSyncCloud();
+                        }}
+                        disabled={isSyncingCloud}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold shadow-sm transition-colors cursor-pointer disabled:opacity-50"
+                      >
+                        {isSyncingCloud ? 'Sedang Menguji Sambungan...' : 'Cuba Semula Sambungan (Test Reconnect)'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setIsQuotaBannerDismissed(true)}
+                  className="text-amber-400 hover:text-white p-1 rounded-lg hover:bg-amber-500/20 cursor-pointer shrink-0"
+                  title="Tutup pemberitahuan"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {syncToastMessage && (
+            <div className="mb-4 p-4 rounded-2xl bg-emerald-500/15 border border-emerald-500/40 text-emerald-200 text-xs flex items-center justify-between shadow-lg animate-in fade-in slide-in-from-top-2 duration-300">
+              <div className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+                <span className="leading-relaxed font-semibold">{syncToastMessage}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSyncToastMessage(null)}
+                className="text-emerald-400 hover:text-white p-1 rounded-lg hover:bg-emerald-500/20 cursor-pointer ml-3 shrink-0"
+                title="Tutup"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {migrationNotice && (
+            <div className="mb-4 p-4 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 text-xs flex items-center justify-between shadow-lg">
+              <div className="flex items-center gap-2.5">
+                <AlertCircle className="w-5 h-5 text-amber-400 shrink-0" />
+                <span className="leading-relaxed font-medium">{migrationNotice}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMigrationNotice(null)}
+                className="text-amber-400 hover:text-white p-1 rounded-lg hover:bg-amber-500/20 cursor-pointer ml-3 shrink-0"
+                title="Tutup"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {activeTab === 'dashboard' && (
+            currentRole === 'ADMIN' && (isAdmin || activeLecturer?.role === 'ADMIN') ? (
+              <AdminControlCenterView
+                subjects={subjects}
+                sessions={sessions}
+                students={students}
+                lecturers={lecturers}
+                attendanceRecords={attendanceRecords}
+                teachingAssignments={teachingAssignments}
+                activeSession={activeSession}
+                onOpenScanner={() => handleTabChange('scanner')}
+                onGoToActivities={() => handleTabChange('dashboard')}
+                onGoToStudents={() => handleTabChange('students')}
+                onGoToReports={() => handleTabChange('reports')}
+                onCloseActiveSession={(id) => handleSetSessionStatus(id, 'CLOSED')}
+                onQuickSimulateScan={handleQuickSimulateScan}
+                onApproveLecturer={handleApproveLecturer}
+                onRejectLecturer={handleRejectLecturer}
+                onOpenLecturerRegistration={() => setIsLecturerSelfRegOpen(true)}
+              />
+            ) : currentRole === 'LECTURER' && activeLecturer ? (
+              <LecturerWorkspaceView
+                activeLecturer={activeLecturer}
+                isAdmin={isAdmin}
+                subjects={subjects}
+                sessions={sessions}
+                students={students}
+                attendanceRecords={attendanceRecords}
+                teachingAssignments={teachingAssignments}
+                enrollments={enrollments}
+                activeSession={activeSession}
+                onOpenScanner={() => handleTabChange('scanner')}
+                onOpenScannerForSession={(sessionId) => {
+                  setSelectedScannerSessionId(sessionId);
+                  handleSetSessionStatus(sessionId, 'OPEN');
+                  handleTabChange('scanner');
+                }}
+                onCreateSession={handleCreateSession}
+                onSetSessionStatus={handleSetSessionStatus}
+                onCloseActiveSession={(id) => handleSetSessionStatus(id, 'CLOSED')}
+                onDeleteSession={handleDeleteSession}
+                onGoToStudents={() => handleTabChange('students')}
+                onGoToReports={() => handleTabChange('reports')}
+                onUpdateSubjectClasses={handleUpdateSubjectClasses}
+              />
+            ) : (
+              <DashboardView
+                activeSession={activeSession}
+                subjects={subjects}
+                sessions={sessions}
+                students={students}
+                attendanceRecords={attendanceRecords}
+                lecturers={lecturers}
+                activeLecturer={activeLecturer}
+                onOpenScanner={() => handleTabChange('scanner')}
+                onGoToActivities={() => handleTabChange('dashboard')}
+                onGoToStudents={() => handleTabChange('students')}
+                onGoToReports={() => handleTabChange('reports')}
+                onCloseActiveSession={(id) => handleSetSessionStatus(id, 'CLOSED')}
+                onQuickSimulateScan={handleQuickSimulateScan}
+              />
+            )
+          )}
+
+          {activeTab === 'scanner' && (
+            <ScannerView
+              activeSession={activeSession}
+              initialSessionId={selectedScannerSessionId || activeSession?.id}
+              allSessions={sessions}
+              students={students}
+              attendanceRecords={attendanceRecords}
+              isAdmin={isAdmin}
+              activeLecturer={activeLecturer}
+              teachingAssignments={teachingAssignments}
+              enrollments={enrollments}
+              onRequestAdminAccess={handleRequestAdminAccess}
+              onProcessScan={handleProcessScan}
+              onGoToActivities={() => handleTabChange('dashboard')}
+              onCloseSession={(sessionId) => handleSetSessionStatus(sessionId, 'CLOSED')}
+              onGoToLecturerWorkspace={() => handleTabChange('dashboard')}
+              onGoToReports={() => handleTabChange('reports')}
+              soundEnabled={soundEnabled}
+              onToggleSound={(enabled) => setSoundEnabled(enabled)}
+            />
+          )}
+
+          {(activeTab === 'activities' || activeTab === 'classes') && (
+            <EventManagementView
+              subjects={subjects}
+              sessions={sessions}
+              attendanceRecords={attendanceRecords}
+              students={students}
+              lecturers={lecturers}
+              enrollments={enrollments}
+              teachingAssignments={teachingAssignments}
+              activeLecturer={activeLecturer}
+              isAdmin={isAdmin}
+              onSetSessionStatus={handleSetSessionStatus}
+              onCreateSubject={handleCreateSubject}
+              onCreateSession={handleCreateSession}
+              onCreateMultipleSessions={handleCreateMultipleSessions}
+              onUpdateSession={handleUpdateSession}
+              onDeleteSession={handleDeleteSession}
+              onDeleteSubject={handleDeleteSubject}
+              onOpenScannerForSession={(sessionId) => {
+                handleSetSessionStatus(sessionId, 'OPEN');
+                handleTabChange('scanner');
+              }}
+              onRequestAdminAccess={handleRequestAdminAccess}
+              onOpenCSVImport={() => setIsCSVModalOpen(true)}
+              onNavigateToStudents={() => handleTabChange('students')}
+              onOpenSelfRegistrationTest={(ctx) => {
+                setSelfRegistrationContext(ctx);
+                setIsSelfRegistrationOpen(true);
+              }}
+            />
+          )}
+
+          {activeTab === 'students' && (
+            <StaffDirectoryView
+              students={students}
+              sessions={sessions}
+              subjects={subjects}
+              lecturers={lecturers}
+              teachingAssignments={teachingAssignments}
+              activeLecturer={activeLecturer}
+              attendanceRecords={attendanceRecords}
+              isAdmin={isAdmin}
+              onAddStudent={handleAddStudent}
+              onDeleteStudent={handleDeleteStudent}
+              onAddLecturer={handleAddLecturer}
+              onDeleteLecturer={handleDeleteLecturer}
+              onAddSubject={handleCreateSubject}
+              onDeleteSubject={handleDeleteSubject}
+              onResetSubjects={handleResetSubjects}
+              onSelectActiveLecturer={handleSelectActiveLecturer}
+              onOpenCSVImport={() => {
+                setCsvImportInitialMode('STUDENT');
+                setIsCSVModalOpen(true);
+              }}
+              onOpenLecturerCSVImport={() => {
+                setCsvImportInitialMode('LECTURER');
+                setIsCSVModalOpen(true);
+              }}
+              onOpenSubjectCSVImport={() => {
+                setCsvImportInitialMode('SUBJECT');
+                setIsCSVModalOpen(true);
+              }}
+              onRequestAdminAccess={handleRequestAdminAccess}
+              onQuickSimulateScan={handleQuickSimulateScan}
+              onUpdateLecturerAssignments={handleUpdateLecturerAssignments}
+            />
+          )}
+
+          {activeTab === 'reports' && (
+            <ReportsView
+              students={students}
+              sessions={sessions}
+              subjects={subjects}
+              attendanceRecords={attendanceRecords}
+              teachingAssignments={teachingAssignments}
+              enrollments={enrollments}
+              isAdmin={isAdmin}
+              activeLecturer={activeLecturer}
+              onRequestAdminAccess={handleRequestAdminAccess}
+              onDeleteSession={handleDeleteSession}
+              onAddStudent={handleAddStudent}
+              onUpdateStudent={handleUpdateStudent}
+              onDeleteStudent={handleDeleteStudent}
+            />
+          )}
+
+          {activeTab === 'guide' && <ConceptGuideView />}
+
+          {activeTab === 'support' && (
+            <SupportInnovationView onReturnToPlatform={handleReturnToPlatform} />
+          )}
+        </main>
+      </div>
+
+      {/* Footer Support CTA & Developer Credit */}
+      <Footer onOpenSupport={handleOpenSupport} />
+
+      {/* Student Self-Check-in Modal (1-Tap & QR Attendance) */}
+      <StudentCheckinModal
+        isOpen={isStudentCheckinOpen}
+        onClose={() => {
+          setIsStudentCheckinOpen(false);
+          setStudentCheckinContext(null);
+          if (window.location.hash.startsWith('#attend')) {
+            try {
+              history.pushState('', document.title, window.location.pathname + window.location.search);
+            } catch (e) {}
+          }
+        }}
+        context={studentCheckinContext}
+        sessions={sessions}
+        students={students}
+        attendanceRecords={attendanceRecords}
+        onSuccess={(student, record) => {
+          // Re-sync attendance records from engine
+          setAttendanceRecords(attendanceEngine.getAttendanceRecords());
+        }}
+        onViewMyAttendance={(studentId) => {
+          setIsStudentCheckinOpen(false);
+          handleTabChange('my-attendance');
+        }}
+      />
+
+      {/* Lecturer PIN / IC Verification Modal */}
+      <AdminPinModal
+        isOpen={isAdminPinModalOpen}
+        onClose={() => setIsAdminPinModalOpen(false)}
+        onSuccess={(lec, role) => {
+          const effectiveRole = role || (lec?.role === 'ADMIN' ? 'ADMIN' : 'LECTURER');
+          setIsAdmin(effectiveRole === 'ADMIN');
+          const updatedAccess = accessManager.getAccessState();
+          setAccessState(updatedAccess);
+          setCurrentRole(effectiveRole);
+          if (lec) {
+            setActiveLecturer(lec);
+            if (!lec.mustChangePin && accessManager.isFirstTimeLecturer(lec.id)) {
+              setIsFirstTimeLecturerModalOpen(true);
+            }
+          } else {
+            setActiveLecturer(attendanceEngine.getActiveLecturer());
+          }
+        }}
+        actionTitle={adminActionTitle}
+        onOpenSelfRegistration={() => {
+          setIsAdminPinModalOpen(false);
+          setIsLecturerSelfRegOpen(true);
+        }}
+      />
+
+      {/* Forced Password Change Modal for First-Time Lecturer Login */}
+      {activeLecturer && (
+        <ForceChangePasswordModal
+          isOpen={Boolean(activeLecturer && activeLecturer.mustChangePin)}
+          lecturer={activeLecturer}
+          onSuccess={(updatedLecturer) => {
+            setActiveLecturer(updatedLecturer);
+            attendanceEngine.setActiveLecturer(updatedLecturer);
+            if (accessManager.isFirstTimeLecturer(updatedLecturer.id)) {
+              setIsFirstTimeLecturerModalOpen(true);
+            }
+          }}
+        />
+      )}
+
+      {/* First-Time Lecturer Onboarding & Subject Association Modal */}
+      {activeLecturer && (
+        <FirstTimeLecturerModal
+          isOpen={isFirstTimeLecturerModalOpen}
+          onClose={() => {
+            setIsFirstTimeLecturerModalOpen(false);
+            accessManager.markLecturerOnboarded(activeLecturer.id);
+          }}
+          lecturer={activeLecturer}
+          teachingAssignments={teachingAssignments}
+          subjects={subjects}
+          onStartTeaching={() => {
+            setIsFirstTimeLecturerModalOpen(false);
+            accessManager.markLecturerOnboarded(activeLecturer.id);
+            handleTabChange('dashboard');
+          }}
+        />
+      )}
+
+      {/* CSV Import Modal (Tri-mode: Students, Lecturers & Subjects) */}
+      <CSVImportModal
+        isOpen={isCSVModalOpen}
+        onClose={() => setIsCSVModalOpen(false)}
+        initialMode={csvImportInitialMode}
+        onImport={handleImportStudents}
+        onImportLecturers={handleImportLecturers}
+        onImportSubjects={handleImportSubjects}
+      />
+
+      {/* PWA Install Modal */}
+      <PWAInstallModal
+        isOpen={isPWAInstallModalOpen}
+        onClose={() => setIsPWAInstallModalOpen(false)}
+        deferredPrompt={deferredPrompt}
+        onInstalled={() => setDeferredPrompt(null)}
+      />
+
+      {/* Student Self-Registration Modal (Triggered by QR Scan or Direct Link) */}
+      <StudentSelfRegistrationModal
+        isOpen={isSelfRegistrationOpen}
+        onClose={() => {
+          setIsSelfRegistrationOpen(false);
+          setSelfRegistrationContext(null);
+          if (window.location.hash.startsWith('#enroll')) {
+            try {
+              history.pushState('', document.title, window.location.pathname + window.location.search);
+            } catch (e) {}
+          }
+        }}
+        context={selfRegistrationContext}
+        onSuccess={(student, enrollment) => {
+          // Re-sync local states
+          setStudents(attendanceEngine.getStudents());
+          setEnrollments(attendanceEngine.getEnrollments());
+        }}
+      />
+
+      {/* Lecturer Self-Registration Modal (Triggered by Admin QR Scan or Direct Link) */}
+      <LecturerSelfRegistrationModal
+        isOpen={isLecturerSelfRegOpen}
+        onClose={() => {
+          setIsLecturerSelfRegOpen(false);
+          if (window.location.hash.startsWith('#lecturer-register')) {
+            try {
+              history.pushState('', document.title, window.location.pathname + window.location.search);
+            } catch (e) {}
+          }
+        }}
+        subjects={subjects}
+      />
+    </div>
+  );
+}

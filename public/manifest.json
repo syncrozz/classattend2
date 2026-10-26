@@ -1,0 +1,25 @@
+{
+  "name": "ClassAttend",
+  "short_name": "ClassAttend",
+  "description": "ClassAttend — Sistem Kehadiran Pelajar",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/android-chrome-192x192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "https://raw.githubusercontent.com/syncrozz/syncrozz-assets/main/logo/ClassAttend/android-chrome-512x512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "scope": "/",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "display": "standalone",
+  "orientation": "portrait"
+}
