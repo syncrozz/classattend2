@@ -37,34 +37,38 @@ interface HeaderProps {
 }
 
 const formatSessionHeaderTitle = (session: { subjectCode?: string; sessionName?: string; className?: string }): string => {
-  const code = (session.subjectCode || '').trim();
+  const code = (session.subjectCode || '').trim().toUpperCase();
   const rawName = (session.sessionName || '').trim();
-  const className = (session.className || '').trim();
+  const className = (session.className || '').trim().toUpperCase();
 
-  if (!code) return rawName || 'Sesi Kehadiran';
-  if (!rawName) return `[${code}]${className ? ` ${className}` : ''}`;
+  // Simple modern model: organized directly by Subject Code + Class (e.g. [MPU2162] DIA3A)
+  if (code && className) {
+    const isLegacyOrAutoTemplate =
+      /kuliah\s*minggu/i.test(rawName) ||
+      new RegExp(`^kuliah\\s*${code}`, 'i').test(rawName) ||
+      rawName.toLowerCase() === `kuliah ${code.toLowerCase()} - ${className.toLowerCase()}` ||
+      rawName.toUpperCase() === `${code} - ${className}` ||
+      rawName.toUpperCase() === `[${code}] ${className}`;
 
-  const cleanCode = code.toUpperCase();
-  const upperName = rawName.toUpperCase();
-
-  // If sessionName already starts with bracketed code: e.g. "[ISI1092] DIA1A"
-  if (upperName.startsWith(`[${cleanCode}]`)) {
-    return rawName;
+    if (!isLegacyOrAutoTemplate && rawName && rawName.toUpperCase() !== code && rawName.toUpperCase() !== className) {
+      const cleanRemark = rawName
+        .replace(/^kuliah\s*minggu\s*\d+[\s:–—-]*/i, '')
+        .replace(/^kuliah[\s:–—-]*/i, '')
+        .trim();
+      if (cleanRemark && cleanRemark.toUpperCase() !== code && cleanRemark.toUpperCase() !== className) {
+        return `[${code}] ${className} • ${cleanRemark}`;
+      }
+    }
+    return `[${code}] ${className}`;
   }
 
-  // If sessionName starts directly with subjectCode: e.g. "ISI1092 - DIA1A" -> "[ISI1092] DIA1A"
-  if (upperName.startsWith(cleanCode)) {
-    const afterCode = rawName.substring(code.length).replace(/^[\s\-–—:;]+/, '').trim();
-    return afterCode ? `[${code}] ${afterCode}` : `[${code}]`;
-  }
-
-  // If sessionName already contains subjectCode anywhere: e.g. "Kuliah ISI1092 - DIA1A"
-  if (upperName.includes(cleanCode)) {
-    return rawName;
-  }
-
-  // Otherwise, prepend bracketed code: e.g. "[ISI1092] Pengenalan Kursus"
-  return `[${code}] ${rawName}`;
+  if (code) return `[${code}]`;
+  return (
+    rawName
+      .replace(/^kuliah\s*minggu\s*\d+[\s:–—-]*/i, '')
+      .replace(/^kuliah[\s:–—-]*/i, '')
+      .trim() || 'Sesi Kehadiran'
+  );
 };
 
 export const Header: React.FC<HeaderProps> = ({
@@ -139,11 +143,11 @@ export const Header: React.FC<HeaderProps> = ({
                   }
                 }
               }}
-              className="cursor-pointer hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 hover:bg-rose-500/20 hover:border-rose-500/40 text-xs font-medium text-emerald-300 hover:text-rose-200 transition-all group select-none active:scale-95 shadow-sm shadow-emerald-950/40"
+              className="cursor-pointer flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 hover:bg-rose-500/20 hover:border-rose-500/40 text-xs font-medium text-emerald-300 hover:text-rose-200 transition-all group select-none active:scale-95 shadow-sm shadow-emerald-950/40"
               title={`Klik untuk Tutup Sesi: ${formatSessionHeaderTitle(activeSession)}`}
             >
               {/* Normal status pulse dot */}
-              <span className="relative flex h-2 w-2 group-hover:hidden">
+              <span className="relative flex h-2 w-2 group-hover:hidden shrink-0">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
               </span>
@@ -153,15 +157,15 @@ export const Header: React.FC<HeaderProps> = ({
                 <X className="w-3.5 h-3.5 stroke-[3]" />
               </span>
 
-              <span className="truncate max-w-[150px] md:max-w-[200px] text-slate-200 group-hover:text-rose-100 font-semibold transition-colors">
+              <span className="truncate max-w-[130px] sm:max-w-[200px] text-slate-200 group-hover:text-rose-100 font-semibold transition-colors">
                 {formatSessionHeaderTitle(activeSession)}
               </span>
 
               {/* Status badge: Normal state shows KELAS BUKA, hover state shows TUTUP SESI */}
-              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 group-hover:hidden transition-all">
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 group-hover:hidden transition-all whitespace-nowrap">
                 KELAS BUKA
               </span>
-              <span className="hidden group-hover:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/30 text-rose-200 uppercase font-extrabold border border-rose-500/50 shadow-xs transition-all">
+              <span className="hidden group-hover:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/30 text-rose-200 uppercase font-extrabold border border-rose-500/50 shadow-xs transition-all whitespace-nowrap">
                 TUTUP SESI
               </span>
             </div>

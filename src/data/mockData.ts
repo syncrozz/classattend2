@@ -250,27 +250,7 @@ export const INITIAL_TEACHING_ASSIGNMENTS: TeachingAssignment[] = [
   }
 ];
 
-export const INITIAL_SESSIONS: AttendanceSession[] = [
-  {
-    id: 'SES-MPU2162-W1',
-    sessionName: 'Kuliah Minggu 1: Pengenalan Perlembagaan Malaysia',
-    subjectId: 'SUB-MPU2162',
-    subjectCode: 'MPU2162',
-    subjectName: 'PENGAJIAN MALAYSIA 2',
-    className: 'DIA3A',
-    teachingAssignmentId: 'TA-KHAIRI-MPU2162-DIA3A',
-    lecturerId: 'LEC-KHAIRI',
-    lecturerName: 'AHMAD KHAIRI BIN MOHD',
-    lecturerEmail: 'khairi.mohd@mara.gov.my',
-    date: new Date().toISOString().split('T')[0],
-    startTime: '08:30',
-    endTime: '10:30',
-    status: 'OPEN',
-    attendanceMethod: 'QR',
-    category: 'CLASS',
-    targetCount: 10
-  }
-];
+export const INITIAL_SESSIONS: AttendanceSession[] = [];
 
 // Initial attendance records for Class sessions
 export const INITIAL_ATTENDANCE_RECORDS: AttendanceRecord[] = [];

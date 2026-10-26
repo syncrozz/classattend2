@@ -578,7 +578,7 @@ export default function App() {
     // 3. Otherwise create a fresh new session
     const newSession: AttendanceSession = {
       id: `SESS-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      sessionName: `Kuliah ${subjectCode} - ${className}`,
+      sessionName: `${subjectCode} - ${className}`,
       subjectCode: subjectCode,
       subjectName: subjectName,
       className: className,

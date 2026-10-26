@@ -363,6 +363,15 @@ class AttendanceEngine {
           this.sessions = [...INITIAL_SESSIONS];
           this.saveSessionsLocally();
         }
+
+        // Clean up obsolete legacy "Kuliah Minggu 1" / SES-MPU2162-W1 session from simplified model
+        const sessionCountBeforeCleanup = this.sessions.length;
+        this.sessions = this.sessions.filter(
+          (s) => s.id !== 'SES-MPU2162-W1' && !s.sessionName?.toLowerCase().includes('kuliah minggu')
+        );
+        if (this.sessions.length !== sessionCountBeforeCleanup) {
+          this.saveSessionsLocally();
+        }
         this.attendanceRecords = storedRecords ? JSON.parse(storedRecords) : [];
         this.enrollments = storedEnrollments ? JSON.parse(storedEnrollments) : [];
         this.teachingAssignments = storedAssignments ? JSON.parse(storedAssignments) : [];
