@@ -920,7 +920,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-indigo-500 selection:text-white">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-indigo-500 selection:text-white w-full max-w-full overflow-x-hidden">
       {/* App Header */}
       <Header
         activeSession={activeSession}
@@ -944,7 +944,7 @@ export default function App() {
         isSyncingCloud={isSyncingCloud}
       />
 
-      <div className="flex-1 max-w-7xl w-full mx-auto flex flex-col md:flex-row">
+      <div className="flex-1 max-w-7xl w-full mx-auto flex flex-col md:flex-row min-w-0 overflow-x-hidden">
         {/* Sidebar Nav */}
         <SidebarNav
           activeTab={activeTab}
@@ -958,7 +958,7 @@ export default function App() {
         />
 
         {/* Main Content Body */}
-        <main className="flex-1 p-4 sm:p-6 lg:p-8 overflow-y-auto">
+        <main className="flex-1 min-w-0 p-3 sm:p-6 lg:p-8 overflow-y-auto overflow-x-hidden w-full max-w-full">
           {isQuotaExceeded && !isQuotaBannerDismissed && (
             <div className="mb-4 p-4 rounded-2xl bg-gradient-to-r from-amber-500/20 via-orange-500/15 to-amber-500/20 border border-amber-500/40 text-amber-100 text-xs shadow-lg animate-in fade-in slide-in-from-top-2 duration-300">
               <div className="flex items-start justify-between gap-3">

@@ -106,17 +106,19 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
   }, [currentRole, totalStudentsCount, totalRecordsCount]);
 
   return (
-    <aside className="group/sidebar w-full md:w-16 md:hover:w-64 transition-all duration-300 ease-in-out bg-slate-900/90 md:bg-slate-900/70 backdrop-blur-md md:min-h-[calc(100vh-4rem)] border-b md:border-b-0 md:border-r border-slate-800/80 p-2 sm:p-3 md:p-2.5 flex flex-col justify-between shrink-0 overflow-hidden z-20 hover:shadow-2xl hover:shadow-black/60 select-none">
-      <div className="space-y-1">
-        <div className="px-2.5 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500 whitespace-nowrap overflow-hidden transition-all duration-200 border-b border-slate-800/40 mb-1">
-          <span className="md:hidden md:group-hover/sidebar:inline">
+    <aside className="group/sidebar w-full md:w-16 md:hover:w-64 transition-all duration-300 ease-in-out bg-slate-900/90 md:bg-slate-900/70 backdrop-blur-md md:min-h-[calc(100vh-4rem)] border-b md:border-b-0 md:border-r border-slate-800/80 p-2 sm:p-2.5 flex flex-col justify-between shrink-0 overflow-hidden z-20 hover:shadow-2xl hover:shadow-black/60 select-none">
+      <div>
+        <div className="hidden md:block px-2.5 py-2 text-[11px] font-bold uppercase tracking-wider text-slate-500 whitespace-nowrap overflow-hidden transition-all duration-200 border-b border-slate-800/40 mb-1">
+          <span className="hidden md:group-hover/sidebar:inline">
             {currentRole === 'LECTURER' ? 'Menu Pensyarah' : currentRole === 'ADMIN' ? 'Menu Pentadbir' : 'Menu Kelas & Subjek'}
           </span>
           <span className="hidden md:inline md:group-hover/sidebar:hidden text-center block text-[10px] text-slate-600 font-mono tracking-widest">
             •••
           </span>
         </div>
-        <nav className="space-y-1">
+
+        {/* Navigation Items: Sleek horizontal scroll strip on mobile (< md), vertical on desktop (md+) */}
+        <nav className="flex md:flex-col gap-1.5 overflow-x-auto no-scrollbar py-0.5 md:py-0 w-full">
           {navItems.map((item) => {
             const Icon = item.icon;
             const isActive = activeTab === item.id;
@@ -126,17 +128,17 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                 id={`sidebar-nav-${item.id}`}
                 onClick={() => onTabChange(item.id)}
                 title={item.label}
-                className={`w-full flex items-center justify-between px-2.5 py-2.5 rounded-xl text-xs sm:text-sm font-medium transition-all cursor-pointer relative group/btn ${
+                className={`flex items-center justify-between px-3 md:px-2.5 py-2 md:py-2.5 rounded-xl text-xs sm:text-sm font-medium transition-all cursor-pointer relative group/btn shrink-0 md:shrink md:w-full ${
                   isActive
                     ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/25 font-semibold'
-                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800/70 bg-slate-950/40 md:bg-transparent border border-slate-800/60 md:border-transparent'
                 }`}
               >
-                <div className="flex items-center min-w-0">
-                  <div className="w-6 h-6 flex items-center justify-center shrink-0">
-                    <Icon className={`w-5 h-5 ${isActive ? 'text-white' : 'text-slate-400 group-hover/btn:text-slate-200 transition-colors'}`} />
+                <div className="flex items-center min-w-0 gap-2 md:gap-0">
+                  <div className="w-5 h-5 md:w-6 md:h-6 flex items-center justify-center shrink-0">
+                    <Icon className={`w-4 h-4 md:w-5 md:h-5 ${isActive ? 'text-white' : 'text-slate-400 group-hover/btn:text-slate-200 transition-colors'}`} />
                   </div>
-                  <span className="ml-3 whitespace-nowrap overflow-hidden md:opacity-0 md:w-0 md:group-hover/sidebar:opacity-100 md:group-hover/sidebar:w-auto transition-all duration-200">
+                  <span className="whitespace-nowrap overflow-hidden md:ml-3 md:opacity-0 md:w-0 md:group-hover/sidebar:opacity-100 md:group-hover/sidebar:w-auto transition-all duration-200 text-xs">
                     {item.label}
                   </span>
                 </div>
@@ -148,7 +150,7 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
                       }`}
                     />
                     <span
-                      className={`inline-block md:hidden md:group-hover/sidebar:inline-block text-[10px] px-1.5 py-0.5 rounded-full font-bold border shrink-0 transition-opacity duration-200 ${
+                      className={`inline-block ml-1.5 md:ml-0 md:hidden md:group-hover/sidebar:inline-block text-[10px] px-1.5 py-0.5 rounded-full font-bold border shrink-0 transition-opacity duration-200 ${
                         isActive ? 'bg-white/20 text-white border-white/30' : item.badgeColor || 'bg-slate-800 text-slate-400 border-slate-700'
                       }`}
                     >
@@ -159,11 +161,27 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({
               </button>
             );
           })}
+
+          {/* On mobile: Place Portal Pas QR right next to tabs in the horizontal strip */}
+          {onOpenQrPortal && (
+            <button
+              id="sidebar-btn-qr-portal-mobile"
+              onClick={onOpenQrPortal}
+              className="md:hidden flex items-center gap-1.5 px-3 py-2 rounded-xl bg-teal-950/40 hover:bg-teal-900/50 border border-teal-500/30 text-teal-300 text-xs font-semibold transition-all cursor-pointer shrink-0"
+              title="Portal Pas QR Pelajar (#/qr)"
+            >
+              <QrCode className="w-4 h-4 text-teal-400 shrink-0" />
+              <span className="whitespace-nowrap text-xs">Portal QR</span>
+              <span className="text-[9px] px-1 py-0.2 rounded bg-teal-500/20 text-teal-300 font-mono font-bold">
+                #/qr
+              </span>
+            </button>
+          )}
         </nav>
       </div>
 
-      {/* Footer Info Card */}
-      <div className="space-y-2 mt-6">
+      {/* Desktop Footer Info Card (hidden on mobile) */}
+      <div className="hidden md:block space-y-2 mt-6">
         {onOpenQrPortal && (
           <button
             id="sidebar-btn-qr-portal"

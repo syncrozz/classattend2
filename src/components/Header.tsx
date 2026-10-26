@@ -91,16 +91,16 @@ export const Header: React.FC<HeaderProps> = ({
   const isPrivileged = Boolean(activeLecturer || isAdmin);
 
   return (
-    <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
+    <header className="sticky top-0 z-40 bg-slate-900/90 backdrop-blur-md border-b border-slate-800 w-full max-w-full overflow-x-hidden">
+      <div className="max-w-7xl mx-auto px-2.5 sm:px-6 lg:px-8 h-14 sm:h-16 flex items-center justify-between gap-1.5 sm:gap-4 min-w-0">
         {/* Brand & Title - Set as trigger to display default homepage view */}
         <div
           id="header-brand-trigger"
           onClick={onGoHome}
-          className="flex items-center gap-3 cursor-pointer group select-none transition-all p-1.5 -ml-1.5 rounded-2xl hover:bg-slate-800/60 active:scale-[0.98]"
+          className="flex items-center gap-2 sm:gap-3 cursor-pointer group select-none transition-all p-1 -ml-1 sm:p-1.5 sm:-ml-1.5 rounded-2xl hover:bg-slate-800/60 active:scale-[0.98] shrink-0 min-w-0"
           title="Klik untuk kembali ke Halaman Utama (Dashboard)"
         >
-          <div className="w-10 h-10 rounded-xl overflow-hidden shadow-lg shadow-indigo-500/20 ring-1 ring-white/20 bg-slate-900 flex items-center justify-center shrink-0 group-hover:ring-indigo-400/50 transition-all">
+          <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-xl overflow-hidden shadow-lg shadow-indigo-500/20 ring-1 ring-white/20 bg-slate-900 flex items-center justify-center shrink-0 group-hover:ring-indigo-400/50 transition-all">
             <img
               src={OFFICIAL_STUDENT_ATTEND_ICON}
               alt="Class Attend Logo"
@@ -108,13 +108,13 @@ export const Header: React.FC<HeaderProps> = ({
               referrerPolicy="no-referrer"
             />
           </div>
-          <div className="flex flex-col justify-center">
+          <div className="flex flex-col justify-center min-w-0">
             <div className="flex flex-col items-start gap-0.5">
-              <h1 className="text-lg font-extrabold tracking-tight leading-none flex items-center gap-1.5">
+              <h1 className="text-sm sm:text-lg font-extrabold tracking-tight leading-none flex items-center gap-1 sm:gap-1.5 whitespace-nowrap">
                 <span className="text-white group-hover:text-indigo-200 transition-colors">CLASS</span>
                 <span className="text-blue-500 group-hover:text-blue-400 transition-colors">ATTEND</span>
               </h1>
-              <span className="text-[9px] uppercase font-bold px-2 py-0.5 rounded-md bg-blue-500/20 text-blue-300 border border-blue-500/30 tracking-wider mt-0.5 inline-flex items-center">
+              <span className="hidden xs:inline-flex text-[8px] sm:text-[9px] uppercase font-bold px-1.5 sm:px-2 py-0.5 rounded-md bg-blue-500/20 text-blue-300 border border-blue-500/30 tracking-wider mt-0.5 items-center whitespace-nowrap">
                 KPM Bandar Penawar
               </span>
             </div>
@@ -122,7 +122,7 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Active Session Pill, Lecturer Badge & Actions */}
-        <div className="flex items-center gap-2 sm:gap-3">
+        <div className="flex items-center gap-1.5 sm:gap-3 min-w-0 shrink">
           {/* Active Class Session Indicator: Only interactive / closable if lecturer or admin is logged in */}
           {activeSession ? (
             isPrivileged ? (
@@ -144,7 +144,7 @@ export const Header: React.FC<HeaderProps> = ({
                     }
                   }
                 }}
-                className="cursor-pointer flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 hover:bg-rose-500/20 hover:border-rose-500/40 text-xs font-medium text-emerald-300 hover:text-rose-200 transition-all group select-none active:scale-95 shadow-sm shadow-emerald-950/40"
+                className="cursor-pointer flex items-center gap-1 sm:gap-2 px-2 sm:px-3 py-1 sm:py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 hover:bg-rose-500/20 hover:border-rose-500/40 text-[11px] sm:text-xs font-medium text-emerald-300 hover:text-rose-200 transition-all group select-none active:scale-95 shadow-sm shadow-emerald-950/40 min-w-0 shrink"
                 title={`Klik untuk Tutup Sesi: ${formatSessionHeaderTitle(activeSession)}`}
               >
                 {/* Normal status pulse dot */}
@@ -158,15 +158,15 @@ export const Header: React.FC<HeaderProps> = ({
                   <X className="w-3.5 h-3.5 stroke-[3]" />
                 </span>
 
-                <span className="truncate max-w-[130px] sm:max-w-[200px] text-slate-200 group-hover:text-rose-100 font-semibold transition-colors">
+                <span className="truncate max-w-[85px] xs:max-w-[130px] sm:max-w-[200px] text-slate-200 group-hover:text-rose-100 font-semibold transition-colors">
                   {formatSessionHeaderTitle(activeSession)}
                 </span>
 
-                {/* Status badge: Normal state shows KELAS BUKA, hover state shows TUTUP SESI */}
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 group-hover:hidden transition-all whitespace-nowrap">
+                {/* Status badge: Hidden on mobile (< sm) to fit compact viewports */}
+                <span className="hidden sm:inline-block text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 group-hover:hidden transition-all whitespace-nowrap">
                   KELAS BUKA
                 </span>
-                <span className="hidden group-hover:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/30 text-rose-200 uppercase font-extrabold border border-rose-500/50 shadow-xs transition-all whitespace-nowrap">
+                <span className="hidden sm:group-hover:inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded bg-rose-500/30 text-rose-200 uppercase font-extrabold border border-rose-500/50 shadow-xs transition-all whitespace-nowrap">
                   TUTUP SESI
                 </span>
               </div>
@@ -175,7 +175,7 @@ export const Header: React.FC<HeaderProps> = ({
               <div
                 id="header-active-session-indicator"
                 role="status"
-                className="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs font-medium text-emerald-300 select-none shadow-sm shadow-emerald-950/40 pointer-events-none"
+                className="flex items-center gap-1 sm:gap-2 px-2 sm:px-3 py-1 sm:py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] sm:text-xs font-medium text-emerald-300 select-none shadow-sm shadow-emerald-950/40 pointer-events-none min-w-0 shrink"
                 title={`Sesi Kelas Sedang Dibuka: ${formatSessionHeaderTitle(activeSession)}`}
               >
                 <span className="relative flex h-2 w-2 shrink-0">
@@ -183,11 +183,11 @@ export const Header: React.FC<HeaderProps> = ({
                   <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
                 </span>
 
-                <span className="truncate max-w-[130px] sm:max-w-[200px] text-slate-200 font-semibold">
+                <span className="truncate max-w-[85px] xs:max-w-[130px] sm:max-w-[200px] text-slate-200 font-semibold">
                   {formatSessionHeaderTitle(activeSession)}
                 </span>
 
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 whitespace-nowrap">
+                <span className="hidden sm:inline-block text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 uppercase font-bold border border-emerald-500/30 whitespace-nowrap">
                   KELAS BUKA
                 </span>
               </div>
@@ -203,7 +203,7 @@ export const Header: React.FC<HeaderProps> = ({
           {activeLecturer || isAdmin ? (
             <div
               id="header-lecturer-indicator"
-              className="flex items-center gap-2 px-2.5 sm:px-3 py-1.5 rounded-xl bg-emerald-950/80 border border-emerald-500/60 text-xs shadow-lg shadow-emerald-950/40 transition-all"
+              className="flex items-center gap-1.5 sm:gap-2 px-1.5 sm:px-3 py-1 sm:py-1.5 rounded-xl bg-emerald-950/80 border border-emerald-500/60 text-xs shadow-lg shadow-emerald-950/40 transition-all shrink-0"
             >
               <div className="relative flex items-center justify-center shrink-0">
                 <div className="w-6 h-6 rounded-lg bg-emerald-600 flex items-center justify-center text-white text-[11px] font-bold shadow-sm">
@@ -253,14 +253,14 @@ export const Header: React.FC<HeaderProps> = ({
                 id="header-btn-lock-session"
                 onClick={onLogoutLecturer}
                 title="Kunci Akses (Keluarkan Sesi)"
-                className="p-1.5 text-emerald-400/80 hover:text-rose-400 hover:bg-rose-950/40 rounded-lg transition-colors cursor-pointer ml-0.5 flex items-center gap-1"
+                className="p-1 sm:p-1.5 text-emerald-400/80 hover:text-rose-400 hover:bg-rose-950/40 rounded-lg transition-colors cursor-pointer ml-0.5 flex items-center gap-1"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 <span className="hidden xl:inline text-[10px] font-semibold text-rose-300">Kunci Akses</span>
               </button>
             </div>
           ) : (
-            <div className="flex items-center gap-1.5 sm:gap-2">
+            <div className="flex items-center gap-1 sm:gap-2">
               <span className="hidden sm:inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700/60 text-xs text-slate-300 font-medium">
                 <User className="w-3.5 h-3.5 text-slate-400" />
                 <span>Paparan Umum</span>
@@ -268,15 +268,14 @@ export const Header: React.FC<HeaderProps> = ({
               <button
                 id="header-btn-lecturer-auth"
                 onClick={onToggleAdminMode}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 text-xs font-semibold transition-all cursor-pointer"
+                className="flex items-center gap-1.5 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-lg bg-indigo-600/20 hover:bg-indigo-600/30 border border-indigo-500/40 text-indigo-300 text-[11px] sm:text-xs font-semibold transition-all cursor-pointer whitespace-nowrap"
                 title="Pengesahan Emel Pensyarah (@mara.gov.my) & Kata Laluan"
               >
-                <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" />
+                <ShieldCheck className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
                 <span>Sahkan Pensyarah</span>
               </button>
             </div>
           )}
-
 
           {/* Cloud Firestore Sync Button */}
           {onForceSyncCloud && (
@@ -284,22 +283,22 @@ export const Header: React.FC<HeaderProps> = ({
               id="header-btn-cloud-sync"
               onClick={onForceSyncCloud}
               disabled={isSyncingCloud}
-              className={`p-2 rounded-lg border transition-all cursor-pointer flex items-center justify-center ${
+              className={`p-1.5 sm:p-2 rounded-lg border transition-all cursor-pointer flex items-center justify-center shrink-0 ${
                 isSyncingCloud
                   ? 'bg-indigo-900/60 border-indigo-500/50 text-indigo-300 animate-pulse'
                   : 'bg-slate-800/80 border-slate-700/60 text-slate-300 hover:text-white hover:bg-slate-700'
               }`}
               title="Segar Semula Data (Tarik Data Terkini dari Cloud Firestore)"
             >
-              <RefreshCw className={`w-4 h-4 ${isSyncingCloud ? 'animate-spin text-indigo-400' : ''}`} />
+              <RefreshCw className={`w-3.5 h-3.5 sm:w-4 sm:h-4 ${isSyncingCloud ? 'animate-spin text-indigo-400' : ''}`} />
             </button>
           )}
 
-          {/* Sound Toggle */}
+          {/* Sound Toggle - Hidden on mobile header to conserve space */}
           <button
             id="header-btn-sound-toggle"
             onClick={() => onToggleSound(!soundEnabled)}
-            className={`p-2 rounded-lg border transition-all cursor-pointer ${
+            className={`hidden sm:flex p-2 rounded-lg border transition-all cursor-pointer ${
               soundEnabled
                 ? 'bg-slate-800 border-slate-700 text-indigo-400 hover:bg-slate-700'
                 : 'bg-slate-900 border-slate-800 text-slate-500 hover:text-slate-400'

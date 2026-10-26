@@ -245,8 +245,6 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const [currentVolume, setCurrentVolume] = useState<number>(() => soundService.getVolume());
   const [copiedLink, setCopiedLink] = useState<boolean>(false);
   const [backupToast, setBackupToast] = useState<string | null>(null);
-  const [simulatedStudentId, setSimulatedStudentId] = useState<string>('');
-  const [simulateSuccessMsg, setSimulateSuccessMsg] = useState<string | null>(null);
 
   const activePaceConfig = getActivePaceConfig(scanPace);
 
@@ -752,45 +750,45 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   };
 
   return (
-    <div id="live-attendance-container" className="space-y-6 animate-fadeIn">
+    <div id="live-attendance-container" className="space-y-4 sm:space-y-6 animate-fadeIn w-full max-w-full min-w-0">
       {/* 1. FIRST VIEWPORT: LIVE ATTENDANCE HEADER & METRIC BAR */}
       <div
         id="live-attendance-header-banner"
-        className="rounded-3xl bg-slate-900 border border-slate-800 p-4 sm:p-6 shadow-2xl relative overflow-hidden space-y-4"
+        className="rounded-3xl bg-slate-900 border border-slate-800 p-3.5 sm:p-6 shadow-2xl relative overflow-hidden space-y-3 sm:space-y-4 w-full"
       >
         {/* Ambient Top Glow */}
         <div className="absolute top-0 right-1/4 w-96 h-32 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none" />
 
         {/* Header Row: Live Status, Subject, Class, Clock, Controls */}
-        <div className="flex flex-wrap items-center justify-between gap-3 relative z-10">
-          <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2.5 sm:gap-3 relative z-10">
+          <div className="flex flex-wrap items-center gap-1.5 sm:gap-2.5">
             {currentSession?.status === 'OPEN' ? (
-              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-black tracking-wider uppercase shadow-sm">
+              <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[11px] sm:text-xs font-black tracking-wider uppercase shadow-sm">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping inline-block" />
                 <span>LIVE KEHADIRAN</span>
               </span>
             ) : (
-              <span className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700 text-xs font-bold uppercase">
+              <span className="inline-flex items-center gap-1.5 px-2.5 sm:px-3 py-1 sm:py-1.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700 text-[11px] sm:text-xs font-bold uppercase">
                 <Lock className="w-3 h-3" />
                 <span>SESI SELESAI</span>
               </span>
             )}
 
             {currentSession?.className && (
-              <span className={`px-3 py-1 rounded-xl text-xs font-black border tracking-wide ${getClassBadgeColor(currentSession.className)}`}>
+              <span className={`px-2.5 sm:px-3 py-1 rounded-xl text-[11px] sm:text-xs font-black border tracking-wide ${getClassBadgeColor(currentSession.className)}`}>
                 Kelas {currentSession.className}
               </span>
             )}
 
             {currentSession?.subjectCode && (
-              <span className="px-2.5 py-1 rounded-xl bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono font-extrabold text-xs">
+              <span className="px-2 sm:px-2.5 py-1 rounded-xl bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 font-mono font-extrabold text-[11px] sm:text-xs">
                 {currentSession.subjectCode}
               </span>
             )}
           </div>
 
           {/* Right Side: Live Clock, Sound Controls, Tamatkan Sesi */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1.5 sm:gap-2">
             {/* Live Clock */}
             <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-slate-950/80 border border-slate-800 text-slate-300 text-xs font-mono">
               <Clock className="w-3.5 h-3.5 text-emerald-400" />
@@ -808,12 +806,12 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               type="button"
               id="btn-toggle-sound"
               onClick={() => onToggleSound(!soundEnabled)}
-              className={`p-2 rounded-xl border text-xs font-semibold cursor-pointer transition-all ${
+              className={`p-1.5 sm:p-2 rounded-xl border text-xs font-semibold cursor-pointer transition-all ${
                 soundEnabled ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/30' : 'bg-slate-950 border-slate-800 text-slate-500 hover:text-slate-300'
               }`}
               title={soundEnabled ? 'Matikan Bunyi Imbasan' : 'Aktifkan Bunyi Imbasan'}
             >
-              {soundEnabled ? <Volume2 className="w-4 h-4 text-indigo-400" /> : <VolumeX className="w-4 h-4" />}
+              {soundEnabled ? <Volume2 className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-indigo-400" /> : <VolumeX className="w-3.5 h-3.5 sm:w-4 sm:h-4" />}
             </button>
 
             {/* Admin Settings (Hidden for regular lecturers to prevent distraction) */}
@@ -822,7 +820,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 type="button"
                 id="btn-scanner-settings-header"
                 onClick={() => setIsSettingsModalOpen(true)}
-                className="px-2.5 py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
+                className="px-2 sm:px-2.5 py-1 sm:py-1.5 rounded-xl bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-500/40 text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer"
                 title="Tetapan Kelajuan & Audio Pengimbas"
               >
                 <SlidersHorizontal className="w-3.5 h-3.5 text-indigo-400" />
@@ -836,7 +834,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 type="button"
                 id="btn-close-session-header"
                 onClick={() => setIsCloseModalOpen(true)}
-                className="min-h-[40px] px-4 py-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 text-white border border-rose-500/40 text-xs font-extrabold shadow-md shadow-rose-900/30 transition-all flex items-center gap-2 cursor-pointer active:scale-95"
+                className="min-h-[36px] sm:min-h-[40px] px-3 sm:px-4 py-1 sm:py-1.5 rounded-xl bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 text-white border border-rose-500/40 text-xs font-extrabold shadow-md shadow-rose-900/30 transition-all flex items-center gap-1.5 sm:gap-2 cursor-pointer active:scale-95 shrink-0"
               >
                 <Lock className="w-3.5 h-3.5" />
                 <span>Tamatkan Sesi</span>
@@ -846,13 +844,13 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         </div>
 
         {/* Subject Name & Details */}
-        <div className="space-y-1 relative z-10">
-          <h2 className="text-xl sm:text-2xl font-black text-white tracking-tight">
+        <div className="space-y-1 relative z-10 min-w-0">
+          <h2 className="text-lg sm:text-2xl font-black text-white tracking-tight break-words">
             {currentSession?.subjectName
               ? `${currentSession.subjectCode ? `${currentSession.subjectCode} — ` : ''}${currentSession.subjectName}`
               : currentSession?.sessionName || 'Sesi Kehadiran'}
           </h2>
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
+          <div className="flex flex-wrap items-center gap-x-3 sm:gap-x-4 gap-y-1 text-xs text-slate-400">
             <span>Pensyarah: <strong className="text-slate-200">{currentSession?.lecturerName || 'Pensyarah Kursus'}</strong></span>
             <span>•</span>
             <span>Tarikh: <strong className="text-slate-200">{currentSession?.date || currentTime.toISOString().split('T')[0]}</strong></span>
@@ -868,17 +866,17 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
         {/* PRIMARY REAL-TIME ATTENDANCE METRIC BAR (MYAU Focus) */}
         <div
           id="real-time-attendance-metric-card"
-          className="p-4 sm:p-5 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-3 relative z-10"
+          className="p-3 sm:p-5 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-2.5 sm:space-y-3 relative z-10"
         >
           <div className="flex flex-wrap items-end justify-between gap-2">
             <div>
-              <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
+              <div className="text-[10px] sm:text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
                 <Users className="w-3.5 h-3.5 text-indigo-400" />
                 <span>STATUS KEHADIRAN KELAS</span>
               </div>
-              <div className="text-2xl sm:text-3xl font-black text-white font-mono tracking-tight flex items-baseline gap-2 pt-0.5">
+              <div className="text-xl sm:text-3xl font-black text-white font-mono tracking-tight flex flex-wrap items-baseline gap-1.5 sm:gap-2 pt-0.5">
                 <span className="text-emerald-400">{matchingPresentRecords.length}</span>
-                <span className="text-slate-500 text-lg sm:text-xl">
+                <span className="text-slate-500 text-base sm:text-xl">
                   / {totalTargetCount > 0 ? totalTargetCount : (targetStudents.length > 0 ? targetStudents.length : (students.length > 0 ? students.length : 0))} HADIR
                 </span>
                 <span className="text-xs font-sans font-bold px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
@@ -889,7 +887,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
             {/* 100% Completion Badge or Absent Count */}
             {isAllPresent ? (
-              <div className="px-3.5 py-1.5 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-black flex items-center gap-2 animate-bounce">
+              <div className="px-3 py-1.5 rounded-xl bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-black flex items-center gap-1.5 sm:gap-2 animate-bounce">
                 <Award className="w-4 h-4 text-emerald-400" />
                 <span>SEMUA PELAJAR DIREKODKAN (100%)</span>
               </div>
@@ -897,7 +895,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               <button
                 type="button"
                 onClick={() => setAttendanceListTab('ABSENT')}
-                className="text-xs text-rose-300 hover:text-rose-200 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-3 py-1.5 rounded-xl font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
+                className="text-xs text-rose-300 hover:text-rose-200 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/20 px-2.5 sm:px-3 py-1.5 rounded-xl font-bold flex items-center gap-1.5 transition-colors cursor-pointer"
               >
                 <UserX className="w-3.5 h-3.5 text-rose-400" />
                 <span>{absentStudents.length} Pelajar {absentLabel} &rarr;</span>
@@ -906,7 +904,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
           </div>
 
           {/* Smooth High-Contrast Progress Bar */}
-          <div className="w-full bg-slate-900 h-3 rounded-full overflow-hidden p-0.5 border border-slate-800">
+          <div className="w-full bg-slate-900 h-2.5 sm:h-3 rounded-full overflow-hidden p-0.5 border border-slate-800">
             <div
               className={`h-full rounded-full transition-all duration-500 ${
                 isAllPresent
@@ -924,14 +922,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
         {/* Session Switcher Selector: Only displayed if multiple active sessions exist */}
         {activeOpenSessions.length > 1 && (
-          <div className="pt-2 border-t border-slate-800/60 flex flex-wrap items-center justify-between gap-3 text-xs">
-            <div className="flex items-center gap-2 flex-1 min-w-[240px]">
-              <span className="text-slate-400 font-semibold whitespace-nowrap">Tukar Sesi:</span>
+          <div className="pt-2 border-t border-slate-800/60 flex flex-wrap items-center justify-between gap-2.5 text-xs">
+            <div className="flex items-center gap-2 flex-1 min-w-0 w-full sm:min-w-[240px]">
+              <span className="text-slate-400 font-semibold whitespace-nowrap text-xs">Tukar Sesi:</span>
               <select
                 id="select-active-session-switch"
                 value={selectedSessionId}
                 onChange={(e) => setSelectedSessionId(e.target.value)}
-                className="w-full px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                className="w-full px-2.5 sm:px-3 py-1.5 rounded-xl bg-slate-950 border border-slate-800 text-xs font-semibold text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer min-w-0"
               >
                 {activeOpenSessions.map((ses) => {
                   const subCode = (ses.subjectCode || '').trim();
@@ -953,7 +951,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
             <button
               type="button"
               onClick={onGoToActivities}
-              className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer"
+              className="text-xs text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer whitespace-nowrap ml-auto"
             >
               <span>Semua Sesi & Kelas</span>
               <ArrowRight className="w-3.5 h-3.5" />
@@ -963,47 +961,47 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
       </div>
 
       {/* 2. MODE SELECTOR TABS (Camera / Projector QR / Manual Search) */}
-      <div className="flex items-center bg-slate-900/80 p-1.5 rounded-2xl border border-slate-800 shadow-inner">
+      <div className="flex items-center bg-slate-900/80 p-1 sm:p-1.5 rounded-2xl border border-slate-800 shadow-inner gap-1 w-full min-w-0">
         <button
           type="button"
           id="tab-mode-camera"
           onClick={() => setScannerMode('CAMERA')}
-          className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+          className={`flex-1 py-2 sm:py-2.5 px-1.5 sm:px-3 rounded-xl text-[11px] sm:text-xs font-extrabold transition-all flex items-center justify-center gap-1 sm:gap-2 cursor-pointer min-w-0 ${
             scannerMode === 'CAMERA'
               ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
               : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
           }`}
         >
-          <Camera className="w-4 h-4" />
-          <span>Kamera Pensyarah</span>
+          <Camera className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+          <span className="truncate">Kamera</span>
         </button>
 
         <button
           type="button"
           id="tab-mode-projector"
           onClick={() => setScannerMode('PROJECTOR_QR')}
-          className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+          className={`flex-1 py-2 sm:py-2.5 px-1.5 sm:px-3 rounded-xl text-[11px] sm:text-xs font-extrabold transition-all flex items-center justify-center gap-1 sm:gap-2 cursor-pointer min-w-0 ${
             scannerMode === 'PROJECTOR_QR'
               ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
               : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
           }`}
         >
-          <Tv className="w-4 h-4" />
-          <span>Pelajar Imbas</span>
+          <Tv className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+          <span className="truncate">Pelajar Imbas</span>
         </button>
 
         <button
           type="button"
           id="tab-mode-manual"
           onClick={() => setScannerMode('MANUAL')}
-          className={`flex-1 py-2.5 px-3 rounded-xl text-xs font-extrabold transition-all flex items-center justify-center gap-2 cursor-pointer ${
+          className={`flex-1 py-2 sm:py-2.5 px-1.5 sm:px-3 rounded-xl text-[11px] sm:text-xs font-extrabold transition-all flex items-center justify-center gap-1 sm:gap-2 cursor-pointer min-w-0 ${
             scannerMode === 'MANUAL'
               ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/30'
               : 'text-slate-400 hover:text-white hover:bg-slate-800/50'
           }`}
         >
-          <Search className="w-4 h-4" />
-          <span>Carian Manual</span>
+          <Search className="w-3.5 h-3.5 sm:w-4 sm:h-4 shrink-0" />
+          <span className="truncate">Carian Manual</span>
         </button>
       </div>
 
@@ -1225,29 +1223,30 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               : `CLASSATTEND_SESSION|${currentSession.id}|${currentSession.subjectCode || ''}|${currentSession.className || ''}`;
 
             return (
-              <div className="rounded-3xl bg-slate-900 border border-slate-800 p-6 space-y-5 text-center shadow-xl">
+              <div className="rounded-3xl bg-slate-900 border border-slate-800 p-4 sm:p-6 space-y-4 sm:space-y-5 text-center shadow-xl w-full min-w-0">
                 <div className="space-y-1">
                   <span className="px-3 py-1 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-xs font-extrabold uppercase">
                     Paparan Skrin Kelas / Projektor
                   </span>
-                  <h3 className="text-lg font-black text-white pt-2">Imbas Kod QR Untuk Hadir</h3>
-                  <p className="text-xs text-slate-400 max-w-sm mx-auto">
+                  <h3 className="text-base sm:text-lg font-black text-white pt-2">Imbas Kod QR Untuk Hadir</h3>
+                  <p className="text-xs text-slate-400 max-w-sm mx-auto px-2">
                     Pelajar boleh menghalakan kamera telefon ke kod QR di bawah untuk mengesahkan kehadiran kelas secara langsung.
                   </p>
                 </div>
 
                 {/* Large Crisp QR Code */}
-                <div className="inline-block p-5 bg-white rounded-3xl shadow-2xl border-4 border-indigo-500/30">
+                <div className="inline-block p-3 sm:p-5 bg-white rounded-3xl shadow-2xl border-4 border-indigo-500/30 max-w-full">
                   <QRCodeSVG
                     value={studentWebUrl}
-                    size={240}
+                    size={210}
                     level="H"
                     includeMargin={true}
+                    className="max-w-full h-auto mx-auto"
                   />
                 </div>
 
-                {/* Quick Share Link & Test Actions */}
-                <div className="max-w-md mx-auto flex flex-col sm:flex-row items-center justify-center gap-2">
+                {/* Quick Share Link */}
+                <div className="max-w-md mx-auto flex items-center justify-center w-full px-2">
                   <button
                     type="button"
                     onClick={() => {
@@ -1257,79 +1256,14 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                         setTimeout(() => setCopiedLink(false), 3000);
                       }
                     }}
-                    className="w-full sm:w-auto px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold border border-slate-700 transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                    className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs font-bold border border-slate-700 transition-all cursor-pointer flex items-center justify-center gap-2 shadow-sm"
                   >
-                    <span>{copiedLink ? '✓ Pautan Disalin!' : '📋 Salin Pautan Kelas (WhatsApp / Telegram)'}</span>
+                    <span>{copiedLink ? '✓ Pautan Disalin!' : '📋 Salin Pautan Kelas'}</span>
                   </button>
-
-                  <button
-                    type="button"
-                    id="btn-test-student-checkin"
-                    onClick={() => {
-                      window.location.hash = `#attend?session=${currentSession.id}&subject=${encodeURIComponent(currentSession.subjectCode || '')}&class=${encodeURIComponent(currentSession.className || '')}&lecturer=${encodeURIComponent(currentSession.lecturerName || '')}&subjectName=${encodeURIComponent(currentSession.subjectName || '')}`;
-                    }}
-                    className="w-full sm:w-auto px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-lg shadow-indigo-600/30 active:scale-95"
-                  >
-                    <Sparkles className="w-3.5 h-3.5 text-indigo-300" />
-                    <span>🧪 Uji Simulasi Pelajar (Buka Sini)</span>
-                  </button>
-                </div>
-
-                {/* Simulation Panel for Projector Testing */}
-                <div className="mt-4 p-4 rounded-2xl bg-slate-950/90 border border-slate-800 text-left space-y-3 max-w-md mx-auto">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-300">
-                      <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
-                      <span>Simulasi Kehadiran Pelajar (Tanpa Statistik / Tanpa Kawalan Sesi)</span>
-                    </div>
-                  </div>
-                  <p className="text-[11px] text-slate-400 leading-relaxed">
-                    Uji imbasan kehadiran sebagai pelajar kelas ini. Selepas imbasan berjaya, pelajar hanya melihat notifikasi pengesahan hadir tanpa paparan statistik atau kebenaran menekan butang buka/tutup sesi.
-                  </p>
-                  <div className="flex flex-col sm:flex-row gap-2">
-                    <select
-                      id="select-simulate-student-projector"
-                      value={simulatedStudentId}
-                      onChange={(e) => setSimulatedStudentId(e.target.value)}
-                      className="flex-1 px-3 py-2 rounded-xl bg-slate-900 border border-slate-700 text-xs text-white focus:outline-none focus:border-indigo-500 cursor-pointer"
-                    >
-                      <option value="">-- Pilih Pelajar Untuk Simulasi --</option>
-                      {targetStudents.slice(0, 30).map((st) => {
-                        const isAlreadyPresent = matchingPresentRecords.some(r => r.studentId === st.id || r.studentId === st.studentId);
-                        return (
-                          <option key={st.id} value={st.studentId}>
-                            {isAlreadyPresent ? '✓ Hadir' : '○ Belum Hadir'} • {st.name} ({st.studentId})
-                          </option>
-                        );
-                      })}
-                    </select>
-                    <button
-                      type="button"
-                      id="btn-simulate-projector-scan"
-                      disabled={!simulatedStudentId}
-                      onClick={() => {
-                        if (simulatedStudentId) {
-                          handleScannedData(simulatedStudentId, 'QR');
-                          const stObj = students.find(s => s.studentId === simulatedStudentId || s.id === simulatedStudentId);
-                          setSimulateSuccessMsg(`Kehadiran ${stObj?.name || simulatedStudentId} direkodkan! Tiada paparan statistik & tiada butang buka/tutup sesi diberikan kepada pelajar.`);
-                          setTimeout(() => setSimulateSuccessMsg(null), 5000);
-                        }
-                      }}
-                      className="px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-bold text-xs shadow-md shadow-emerald-600/30 transition-all cursor-pointer whitespace-nowrap active:scale-95"
-                    >
-                      ⚡ Simulasikan Hadir
-                    </button>
-                  </div>
-                  {simulateSuccessMsg && (
-                    <div className="p-2.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-200 text-xs font-semibold flex items-center gap-2 animate-fadeIn">
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-                      <span>{simulateSuccessMsg}</span>
-                    </div>
-                  )}
                 </div>
 
                 {/* Session Meta on Projector */}
-                <div className="p-3.5 rounded-2xl bg-slate-950 border border-slate-800 max-w-md mx-auto flex items-center justify-around text-xs">
+                <div className="p-3 sm:p-3.5 rounded-2xl bg-slate-950 border border-slate-800 max-w-md mx-auto flex items-center justify-around text-xs w-full">
                   <div>
                     <div className="text-[10px] text-slate-400 uppercase font-semibold">Subjek</div>
                     <strong className="text-indigo-300 font-mono">{currentSession.subjectCode || 'KULIAH'}</strong>
