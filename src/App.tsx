@@ -455,6 +455,16 @@ export default function App() {
     const res = attendanceEngine.updateSubjectClasses(subjectCode, classNames, activeLecturer);
     setSubjects(res.subjects);
     setTeachingAssignments(res.teachingAssignments);
+    const updatedLecturers = attendanceEngine.getLecturers();
+    setLecturers(updatedLecturers);
+    if (activeLecturer) {
+      const refreshedActive = updatedLecturers.find(
+        (l) => l.id === activeLecturer.id || (l.email && l.email.toLowerCase() === activeLecturer.email.toLowerCase())
+      );
+      if (refreshedActive) {
+        setActiveLecturer(refreshedActive);
+      }
+    }
     soundService.playSuccess();
     auditLogger.log({
       category: 'MASTER_DATA',
@@ -1106,6 +1116,7 @@ export default function App() {
                 activeLecturer={activeLecturer}
                 isAdmin={isAdmin}
                 currentRole={currentRole}
+                teachingAssignments={teachingAssignments}
                 onOpenScanner={() => handleTabChange('scanner')}
                 onGoToActivities={() => handleTabChange('dashboard')}
                 onGoToStudents={() => handleTabChange('students')}

@@ -115,31 +115,34 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
       }
     });
 
-    // 2. From assignedClasses / assignedSections on lecturer profile
-    const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
-    profileClasses.forEach((cls) => {
-      if (cls && cls.trim()) {
-        const norm = normalizeClassCode(cls);
-        if (!classMap.has(norm)) {
-          classMap.set(norm, toCanonicalClassCode(cls));
-        }
-      }
-    });
-
-    // 3. From authorized sessions
-    sessions.forEach((s) => {
-      if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
-        const matchId = Boolean(s.lecturerId && s.lecturerId.trim().toLowerCase() === lecId);
-        const matchEmail = Boolean(s.lecturerEmail && lecEmail && s.lecturerEmail.trim().toLowerCase() === lecEmail);
-        const matchName = Boolean(s.lecturerName && lecName && s.lecturerName.trim().toLowerCase() === lecName);
-        if (matchId || matchEmail || matchName) {
-          const norm = normalizeClassCode(s.className);
+    // Fallback ONLY when this lecturer has NO active teaching assignments at all
+    if (classMap.size === 0) {
+      // 2. From assignedClasses / assignedSections on lecturer profile
+      const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
+      profileClasses.forEach((cls) => {
+        if (cls && cls.trim()) {
+          const norm = normalizeClassCode(cls);
           if (!classMap.has(norm)) {
-            classMap.set(norm, toCanonicalClassCode(s.className));
+            classMap.set(norm, toCanonicalClassCode(cls));
           }
         }
-      }
-    });
+      });
+
+      // 3. From authorized sessions
+      sessions.forEach((s) => {
+        if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
+          const matchId = Boolean(s.lecturerId && s.lecturerId.trim().toLowerCase() === lecId);
+          const matchEmail = Boolean(s.lecturerEmail && lecEmail && s.lecturerEmail.trim().toLowerCase() === lecEmail);
+          const matchName = Boolean(s.lecturerName && lecName && s.lecturerName.trim().toLowerCase() === lecName);
+          if (matchId || matchEmail || matchName) {
+            const norm = normalizeClassCode(s.className);
+            if (!classMap.has(norm)) {
+              classMap.set(norm, toCanonicalClassCode(s.className));
+            }
+          }
+        }
+      });
+    }
 
     return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
   }, [isLecturerRestricted, activeLecturer, uniqueClasses, teachingAssignments, sessions]);
@@ -1249,7 +1252,7 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
                     onChange={(e) => setEditStudentForm({ ...editStudentForm, className: e.target.value })}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-bold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
                   >
-                    {uniqueClasses.map((cls, idx) => (
+                    {availableMatrixClasses.map((cls, idx) => (
                       <option key={`edit-cls-opt-${cls}-${idx}`} value={cls}>
                         Kelas {cls}
                       </option>
@@ -1389,7 +1392,7 @@ export const AttendanceMatrixView: React.FC<AttendanceMatrixViewProps> = ({
                     onChange={(e) => setAddStudentForm({ ...addStudentForm, className: e.target.value })}
                     className="w-full px-3.5 py-2.5 rounded-xl bg-slate-950 border border-slate-800 text-sm font-bold text-indigo-300 focus:outline-none focus:border-indigo-500 cursor-pointer"
                   >
-                    {uniqueClasses.map((cls, idx) => (
+                    {availableMatrixClasses.map((cls, idx) => (
                       <option key={`add-cls-opt-${cls}-${idx}`} value={cls}>
                         Kelas {cls}
                       </option>

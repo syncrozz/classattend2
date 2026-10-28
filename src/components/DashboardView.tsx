@@ -6,9 +6,10 @@ import {
   AttendanceRecord,
   ScanResult,
   Lecturer,
-  Enrollment
+  Enrollment,
+  TeachingAssignment
 } from '../types';
-import { normalizeClassCode } from '../utils/classHelper';
+import { normalizeClassCode, toCanonicalClassCode } from '../utils/classHelper';
 import { getClassBadgeColor, getInitials, getStudentColor, stripStudentId } from '../utils/studentUtils';
 import {
   Users,
@@ -51,6 +52,7 @@ interface DashboardViewProps {
   activeLecturer?: Lecturer | null;
   isAdmin?: boolean;
   currentRole?: string;
+  teachingAssignments?: TeachingAssignment[];
   onOpenScanner: () => void;
   onGoToActivities: () => void;
   onGoToStudents: () => void;
@@ -69,6 +71,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   activeLecturer,
   isAdmin = false,
   currentRole = 'STUDENT',
+  teachingAssignments = [],
   onOpenScanner,
   onGoToActivities,
   onGoToStudents,
@@ -111,12 +114,57 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
       ? Math.round((matchingActiveRecords.length / targetStudentsForActive.length) * 100)
       : 0;
 
+  // Lecturer assigned classes (authoritative from active teaching assignments)
+  const lecturerClasses = useMemo(() => {
+    if (!activeLecturer || isAdmin) return null;
+    const classMap = new Map<string, string>();
+    (teachingAssignments || []).forEach((ta) => {
+      const isActive = ta.status === 'ACTIVE' || !ta.status;
+      const matchId = ta.lecturerId === activeLecturer.id;
+      const matchEmail = Boolean(
+        ta.lecturerEmail &&
+        activeLecturer.email &&
+        ta.lecturerEmail.trim().toLowerCase() === activeLecturer.email.trim().toLowerCase()
+      );
+      const matchName = Boolean(
+        ta.lecturerName &&
+        activeLecturer.name &&
+        ta.lecturerName.trim().toLowerCase() === activeLecturer.name.trim().toLowerCase()
+      );
+      if (isActive && (matchId || matchEmail || matchName) && ta.className) {
+        const norm = normalizeClassCode(ta.className);
+        if (!classMap.has(norm)) {
+          classMap.set(norm, toCanonicalClassCode(ta.className));
+        }
+      }
+    });
+
+    if (classMap.size === 0) {
+      const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
+      profileClasses.forEach((cls) => {
+        if (cls && cls.trim()) {
+          const norm = normalizeClassCode(cls);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(cls));
+          }
+        }
+      });
+    }
+
+    return classMap.size > 0 ? Array.from(classMap.values()) : null;
+  }, [activeLecturer, isAdmin, teachingAssignments]);
+
   // Dynamic Class Sets Distribution
   const availableClassSets: string[] = (Array.from(
     new Set(students.map((s) => s.className).filter(Boolean))
   ) as string[]).sort();
 
-  const classList = availableClassSets.length > 0 ? availableClassSets : ['DIA_3A', 'DIA_3B', 'DIA_3C', 'DIA_3D', 'DIA_4A', 'DIA_4B', 'DIA_4C', 'DIA_4D'];
+  const classList = useMemo(() => {
+    if (lecturerClasses && lecturerClasses.length > 0) {
+      return [...lecturerClasses].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    }
+    return availableClassSets.length > 0 ? availableClassSets : ['DIA_3A', 'DIA_3B', 'DIA_3C', 'DIA_3D', 'DIA_4A', 'DIA_4B', 'DIA_4C', 'DIA_4D'];
+  }, [lecturerClasses, availableClassSets]);
 
   // Filter sessions by selected subject
   const filteredSessions = selectedSubjectFilter === 'ALL'
@@ -877,17 +925,40 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   <span>{sub.lecturerName || 'Pensyarah Kursus'}</span>
                 </div>
                 <div className="flex flex-wrap gap-1 pt-1">
-                  {(sub.sections || []).length > 0 ? (
-                    Array.from(new Set<string>(sub.sections || [])).map((sec, secIdx) => (
-                      <span key={`dash-sub-${sub.id}-sec-${sec}-${secIdx}`} className="text-[9px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300 font-mono">
-                        {sec}
+                  {(() => {
+                    let classesToShow: string[] = [];
+                    if (activeLecturer && !isAdmin && teachingAssignments && teachingAssignments.length > 0) {
+                      const lecId = (activeLecturer.id || '').trim().toLowerCase();
+                      const lecEmail = (activeLecturer.email || '').trim().toLowerCase();
+                      const lecName = (activeLecturer.name || '').trim().toLowerCase();
+                      classesToShow = teachingAssignments
+                        .filter((ta) => {
+                          const isActive = ta.status === 'ACTIVE' || !ta.status;
+                          const matchSub = (ta.subjectCode || '').trim().toUpperCase() === (sub.code || '').trim().toUpperCase();
+                          const matchId = Boolean(ta.lecturerId && ta.lecturerId.trim().toLowerCase() === lecId);
+                          const matchEmail = Boolean(ta.lecturerEmail && lecEmail && ta.lecturerEmail.trim().toLowerCase() === lecEmail);
+                          const matchName = Boolean(ta.lecturerName && lecName && ta.lecturerName.trim().toLowerCase() === lecName);
+                          return isActive && matchSub && (matchId || matchEmail || matchName);
+                        })
+                        .map((ta) => toCanonicalClassCode(ta.className));
+                    }
+                    if (classesToShow.length === 0) {
+                      classesToShow = Array.from(new Set<string>(sub.sections || []));
+                    } else {
+                      classesToShow = Array.from(new Set(classesToShow));
+                    }
+                    return classesToShow.length > 0 ? (
+                      classesToShow.map((sec, secIdx) => (
+                        <span key={`dash-sub-${sub.id}-sec-${sec}-${secIdx}`} className="text-[9px] px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300 font-mono">
+                          {sec}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="text-[10px] text-teal-400/80 font-medium">
+                        Ditentukan oleh Pensyarah
                       </span>
-                    ))
-                  ) : (
-                    <span className="text-[10px] text-teal-400/80 font-medium">
-                      Ditentukan oleh Pensyarah
-                    </span>
-                  )}
+                    );
+                  })()}
                 </div>
               </div>
             ))}

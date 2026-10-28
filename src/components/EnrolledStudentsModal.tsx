@@ -75,9 +75,16 @@ export const EnrolledStudentsModal: React.FC<EnrolledStudentsModalProps> = ({
     return Array.from(map.values());
   }, [enrollments, subject, isSyncing]);
 
-  // Strictly determine the classes assigned to this subject (via subject.sections or teaching assignments)
+  // Strictly determine the classes assigned to this subject (via active teaching assignments or subject.sections)
   const targetClassesForSubject = useMemo(() => {
     if (!subject) return [];
+    const activeLec = attendanceEngine.getActiveLecturer();
+    if (activeLec && activeLec.role !== 'ADMIN') {
+      const lecClasses = attendanceEngine.getAssignedClassesForSubject(subject.code, activeLec.id);
+      if (lecClasses.length > 0) {
+        return lecClasses;
+      }
+    }
     // 1. Direct sections defined on subject
     const directSections = (subject.sections || [])
       .map((s) => s.trim().toUpperCase())

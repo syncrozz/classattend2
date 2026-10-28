@@ -343,23 +343,15 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
         }
       });
     });
-    editingClasses.forEach((c) => {
-      if (c?.trim()) {
-        const norm = normalizeClassCode(c);
-        if (!classMap.has(norm)) {
-          classMap.set(norm, toCanonicalClassCode(c));
-        }
-      }
-    });
     return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  }, [students, subjects, editingClasses]);
+  }, [students, subjects]);
 
   const handleOpenClassSettings = (subjectCodeToEdit?: string) => {
     const targetCode = subjectCodeToEdit || selectedSubject?.code || availableSubjects[0]?.code || '';
     const normTargetCode = targetCode.trim().toUpperCase().replace(/\s+/g, '');
     setEditingSubjectCode(normTargetCode);
 
-    // Find current classes for this subject
+    // Find current classes for this subject specifically for this active lecturer
     const currentClassesMap = new Map<string, string>();
     myAssignments
       .filter((ta) => ta.status === 'ACTIVE' && (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '') === normTargetCode)
@@ -375,18 +367,21 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
         }
       });
 
-    const targetSub = subjects.find((s) => s.code.toUpperCase().replace(/\s+/g, '') === normTargetCode);
-    (targetSub?.sections || []).forEach((sec) => {
-      if (sec && sec.trim()) {
-        const normCls = normalizeClassCode(sec);
-        if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
-        if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
-        const canonical = toCanonicalClassCode(sec);
-        if (!currentClassesMap.has(normCls)) {
-          currentClassesMap.set(normCls, canonical);
+    // Fallback ONLY if this lecturer has NO active assignments for this subject
+    if (currentClassesMap.size === 0) {
+      const targetSub = subjects.find((s) => (s.code || '').trim().toUpperCase().replace(/\s+/g, '') === normTargetCode);
+      (targetSub?.sections || []).forEach((sec) => {
+        if (sec && sec.trim()) {
+          const normCls = normalizeClassCode(sec);
+          if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
+          if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
+          const canonical = toCanonicalClassCode(sec);
+          if (!currentClassesMap.has(normCls)) {
+            currentClassesMap.set(normCls, canonical);
+          }
         }
-      }
-    });
+      });
+    }
 
     if (currentClassesMap.size === 0) {
       if (normTargetCode === 'MPU2162') currentClassesMap.set('DIA3A', 'DIA3A');
@@ -420,18 +415,21 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
         }
       });
 
-    const targetSub = subjects.find((s) => s.code.toUpperCase().replace(/\s+/g, '') === normTargetCode);
-    (targetSub?.sections || []).forEach((sec) => {
-      if (sec && sec.trim()) {
-        const normCls = normalizeClassCode(sec);
-        if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
-        if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
-        const canonical = toCanonicalClassCode(sec);
-        if (!currentClassesMap.has(normCls)) {
-          currentClassesMap.set(normCls, canonical);
+    // Fallback ONLY if this lecturer has NO active assignments for this subject
+    if (currentClassesMap.size === 0) {
+      const targetSub = subjects.find((s) => (s.code || '').trim().toUpperCase().replace(/\s+/g, '') === normTargetCode);
+      (targetSub?.sections || []).forEach((sec) => {
+        if (sec && sec.trim()) {
+          const normCls = normalizeClassCode(sec);
+          if (normTargetCode === 'MPU2162' && normCls !== 'DIA3A') return;
+          if (normTargetCode === 'MPU2412' && normCls === 'DIA3A') return;
+          const canonical = toCanonicalClassCode(sec);
+          if (!currentClassesMap.has(normCls)) {
+            currentClassesMap.set(normCls, canonical);
+          }
         }
-      }
-    });
+      });
+    }
 
     if (currentClassesMap.size === 0) {
       if (normTargetCode === 'MPU2162') currentClassesMap.set('DIA3A', 'DIA3A');
@@ -477,8 +475,10 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
     }
 
     // If currently selected subject was edited, ensure selectedClass stays valid
-    if (selectedSubjectCode.toUpperCase() === editingSubjectCode.toUpperCase()) {
-      if (editingClasses.length > 0 && !editingClasses.includes(selectedClass)) {
+    const normSelected = (selectedSubjectCode || '').trim().toUpperCase().replace(/\s+/g, '');
+    const normEditing = (editingSubjectCode || '').trim().toUpperCase().replace(/\s+/g, '');
+    if (normSelected === normEditing) {
+      if (editingClasses.length > 0 && !editingClasses.some((c) => normalizeClassCode(c) === normalizeClassCode(selectedClass))) {
         setSelectedClass(editingClasses[0]);
       }
     }
@@ -1905,7 +1905,7 @@ export const LecturerWorkspaceView: React.FC<LecturerWorkspaceViewProps> = ({
 
               <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2.5">
                 {allCollegeClasses.map((cls) => {
-                  const isChecked = editingClasses.some((c) => c.toUpperCase() === cls.toUpperCase());
+                  const isChecked = editingClasses.some((c) => normalizeClassCode(c) === normalizeClassCode(cls));
                   return (
                     <button
                       key={cls}

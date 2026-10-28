@@ -100,7 +100,8 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
     return filterAuthorizedSessions(sessions, activeLecturer, isAdmin, teachingAssignments);
   }, [sessions, activeLecturer, isAdmin, teachingAssignments, isLecturerRestricted]);
 
-  // Lecturer assigned classes: derived from Teaching Assignments, lecturer profile, and authorized sessions
+  // Lecturer assigned classes: derived from Teaching Assignments (authoritative),
+  // with lecturer profile and authorized sessions ONLY as a fallback if no assignments exist.
   const lecturerClasses = useMemo(() => {
     if (!isLecturerRestricted || !activeLecturer) {
       return null; // Admin sees all classes
@@ -109,7 +110,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
 
     // 1. From Teaching Assignments (authoritative)
     (teachingAssignments || []).forEach((ta) => {
-      const isActive = ta.status === 'ACTIVE';
+      const isActive = ta.status === 'ACTIVE' || !ta.status;
       const matchId = ta.lecturerId === activeLecturer.id;
       const matchEmail = Boolean(
         ta.lecturerEmail &&
@@ -129,46 +130,39 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }
     });
 
-    // 2. From assignedClasses / assignedSections on lecturer profile
-    const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
-    profileClasses.forEach((cls) => {
-      if (cls && cls.trim()) {
-        const norm = normalizeClassCode(cls);
-        if (!classMap.has(norm)) {
-          classMap.set(norm, toCanonicalClassCode(cls));
+    // Fallback ONLY when this lecturer has NO active teaching assignments at all
+    if (classMap.size === 0) {
+      // 2. From assignedClasses / assignedSections on lecturer profile
+      const profileClasses = activeLecturer.assignedClasses || activeLecturer.assignedSections || [];
+      profileClasses.forEach((cls) => {
+        if (cls && cls.trim()) {
+          const norm = normalizeClassCode(cls);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(cls));
+          }
         }
-      }
-    });
+      });
 
-    // 3. From authorized sessions
-    authorizedSessions.forEach((s) => {
-      if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
-        const norm = normalizeClassCode(s.className);
-        if (!classMap.has(norm)) {
-          classMap.set(norm, toCanonicalClassCode(s.className));
+      // 3. From authorized sessions
+      authorizedSessions.forEach((s) => {
+        if (s.className && s.className.trim() && s.className !== 'ALL' && s.className !== 'SEMUA') {
+          const norm = normalizeClassCode(s.className);
+          if (!classMap.has(norm)) {
+            classMap.set(norm, toCanonicalClassCode(s.className));
+          }
         }
-      }
-    });
+      });
+    }
 
     return Array.from(classMap.values());
   }, [isLecturerRestricted, activeLecturer, teachingAssignments, authorizedSessions]);
 
   // Unique classes dynamically scoped:
-  // If lecturer restricted, strictly classes taught by this lecturer.
+  // If lecturer restricted, strictly classes taught by this lecturer (no resurrection from past sessions).
   // Otherwise, all classes registered in students/sessions.
   const uniqueClasses: string[] = useMemo(() => {
     if (lecturerClasses !== null) {
-      const classMap = new Map<string, string>();
-      [...lecturerClasses, ...(authorizedSessions.map((s) => s.className?.trim()).filter(Boolean) as string[])].forEach((c) => {
-        if (c && c !== 'ALL' && c !== 'SEMUA') {
-          const norm = normalizeClassCode(c);
-          if (!classMap.has(norm)) {
-            classMap.set(norm, toCanonicalClassCode(c));
-          }
-        }
-      });
-
-      return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      return [...lecturerClasses].sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     }
 
     const classMap = new Map<string, string>();
@@ -181,7 +175,7 @@ export const ReportsView: React.FC<ReportsViewProps> = ({
       }
     });
     return Array.from(classMap.values()).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-  }, [students, sessions, authorizedSessions, lecturerClasses]);
+  }, [students, sessions, lecturerClasses]);
 
   // Scoped students: Only students belonging to the lecturer's assigned classes
   const scopedStudents = useMemo(() => {

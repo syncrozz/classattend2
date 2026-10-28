@@ -34,7 +34,7 @@ import {
   normalizeLecturerName
 } from '../utils/staffUtils';
 import { KNOWN_KPM_COURSES, deduceDepartmentFromCode, splitClassNames, normalizeClassCode } from '../utils/csvHelper';
-import { areClassesMatching } from '../utils/classHelper';
+import { areClassesMatching, toCanonicalClassCode } from '../utils/classHelper';
 import { isLecturerAuthorizedForSession } from '../utils/sessionAuth';
 import { auditLogger } from './auditLogger';
 import {
@@ -1232,12 +1232,13 @@ class AttendanceEngine {
 
       // 5. Fetch Teaching Assignments
       const assignmentsSnap = await getDocs(collection(db, 'teaching_assignments'));
-      if (!assignmentsSnap.empty) {
-        const data = assignmentsSnap.docs.map((docSnap) => docSnap.data() as TeachingAssignment);
-        this.teachingAssignments = data;
-        this.saveTeachingAssignmentsLocally();
-        this.notifyTeachingAssignmentListeners();
-      }
+      const taData = assignmentsSnap.empty
+        ? []
+        : assignmentsSnap.docs.map((docSnap) => docSnap.data() as TeachingAssignment);
+      this.teachingAssignments = taData;
+      this.syncAssignmentsToSubjectsAndLecturers(taData);
+      this.saveTeachingAssignmentsLocally();
+      this.notifyTeachingAssignmentListeners();
 
       // 6. Fetch Records
       const recordsSnap = await getDocs(collection(db, 'attendance_records'));
@@ -1772,6 +1773,9 @@ class AttendanceEngine {
         q,
         (snapshot) => {
           if (snapshot.empty) {
+            this.teachingAssignments = [];
+            this.syncAssignmentsToSubjectsAndLecturers([]);
+            this.saveTeachingAssignmentsLocally();
             this.notifyTeachingAssignmentListeners();
             return;
           }
@@ -1801,11 +1805,9 @@ class AttendanceEngine {
             };
           });
 
-          if (data.length > 0) {
-            this.teachingAssignments = data;
-            this.syncAssignmentsToSubjectsAndLecturers(data);
-            this.saveTeachingAssignmentsLocally();
-          }
+          this.teachingAssignments = data;
+          this.syncAssignmentsToSubjectsAndLecturers(data);
+          this.saveTeachingAssignmentsLocally();
           this.notifyTeachingAssignmentListeners();
         },
         (error) => {
@@ -1850,8 +1852,8 @@ class AttendanceEngine {
   }
 
   private syncAssignmentsToSubjectsAndLecturers(assignments: TeachingAssignment[]) {
-    if (!assignments || assignments.length === 0) return;
-    const activeAssignments = assignments.filter((ta) => ta.status !== 'REJECTED');
+    if (!assignments) return;
+    const activeAssignments = (assignments || []).filter((ta) => ta.status === 'ACTIVE' || !ta.status);
 
     // 1. Group active assignments by subject code
     const subToClassesMap = new Map<string, Set<string>>();
@@ -1864,7 +1866,7 @@ class AttendanceEngine {
         subToClassesMap.set(code, new Set());
       }
       if (ta.className) {
-        subToClassesMap.get(code)!.add(ta.className.trim().toUpperCase());
+        subToClassesMap.get(code)!.add(toCanonicalClassCode(ta.className));
       }
       if (ta.lecturerId && !subToLecturerMap.has(code)) {
         subToLecturerMap.set(code, {
@@ -1878,19 +1880,20 @@ class AttendanceEngine {
     let subjectsChanged = false;
     this.subjects = this.subjects.map((sub) => {
       const code = (sub.code || '').trim().toUpperCase();
-      const assignedClasses = subToClassesMap.get(code);
+      const assignedClassesSet = subToClassesMap.get(code);
       const lecInfo = subToLecturerMap.get(code);
 
-      if (assignedClasses && assignedClasses.size > 0) {
-        const mergedSections = Array.from(new Set([...(sub.sections || []), ...Array.from(assignedClasses)]));
-        if (
-          mergedSections.length !== (sub.sections || []).length ||
-          (lecInfo && sub.lecturerId !== lecInfo.id)
-        ) {
+      if (assignedClassesSet !== undefined) {
+        const assignedClasses = Array.from(assignedClassesSet);
+        const currentSections = sub.sections || [];
+        const isDifferent =
+          assignedClasses.length !== currentSections.length ||
+          assignedClasses.some((c) => !currentSections.includes(c));
+        if (isDifferent || (lecInfo && sub.lecturerId !== lecInfo.id)) {
           subjectsChanged = true;
           return {
             ...sub,
-            sections: mergedSections,
+            sections: assignedClasses,
             lecturerId: lecInfo?.id || sub.lecturerId,
             lecturerName: lecInfo?.name || sub.lecturerName,
             lecturerEmail: lecInfo?.email || sub.lecturerEmail
@@ -1910,33 +1913,69 @@ class AttendanceEngine {
     const lecToClassesMap = new Map<string, Set<string>>();
 
     activeAssignments.forEach((ta) => {
-      const lecId = ta.lecturerId;
-      if (!lecId) return;
-      if (!lecToSubjectsMap.has(lecId)) {
-        lecToSubjectsMap.set(lecId, new Set());
-        lecToClassesMap.set(lecId, new Set());
-      }
-      lecToSubjectsMap.get(lecId)!.add(`${(ta.subjectCode || '').toUpperCase()} - ${ta.subjectName || ''}`);
-      if (ta.className) {
-        lecToClassesMap.get(lecId)!.add(ta.className.trim().toUpperCase());
-      }
+      const lecId = (ta.lecturerId || '').trim();
+      const lecEmail = (ta.lecturerEmail || '').trim().toLowerCase();
+      if (!lecId && !lecEmail) return;
+
+      const keys = [lecId, lecEmail].filter(Boolean);
+      keys.forEach((key) => {
+        if (!lecToSubjectsMap.has(key)) {
+          lecToSubjectsMap.set(key, new Set());
+          lecToClassesMap.set(key, new Set());
+        }
+        if (ta.subjectCode) {
+          lecToSubjectsMap.get(key)!.add(`${(ta.subjectCode || '').toUpperCase()} - ${ta.subjectName || ''}`);
+        }
+        if (ta.className) {
+          lecToClassesMap.get(key)!.add(toCanonicalClassCode(ta.className));
+        }
+      });
     });
 
     let lecturersChanged = false;
     this.lecturers = this.lecturers.map((lec) => {
-      const assignedSubs = lecToSubjectsMap.get(lec.id);
-      const assignedCls = lecToClassesMap.get(lec.id);
-      if (assignedSubs || assignedCls) {
-        const newSubs = Array.from(new Set([...(lec.assignedSubjects || []), ...(assignedSubs ? Array.from(assignedSubs) : [])]));
-        const newCls = Array.from(new Set([...(lec.assignedClasses || []), ...(assignedCls ? Array.from(assignedCls) : [])]));
-        if (newSubs.length !== (lec.assignedSubjects || []).length || newCls.length !== (lec.assignedClasses || []).length) {
+      const lecId = (lec.id || '').trim();
+      const lecEmail = (lec.email || '').trim().toLowerCase();
+      const assignedSubsSet = (lecId && lecToSubjectsMap.get(lecId)) || (lecEmail && lecToSubjectsMap.get(lecEmail));
+      const assignedClsSet = (lecId && lecToClassesMap.get(lecId)) || (lecEmail && lecToClassesMap.get(lecEmail));
+
+      if (assignedSubsSet !== undefined || assignedClsSet !== undefined) {
+        const newClasses = assignedClsSet ? Array.from(assignedClsSet) : [];
+        const newSubs = assignedSubsSet ? Array.from(assignedSubsSet) : [];
+
+        const currentClasses = lec.assignedClasses || [];
+        const currentSubs = lec.assignedSubjects || [];
+
+        const classesChanged =
+          newClasses.length !== currentClasses.length ||
+          newClasses.some((c) => !currentClasses.includes(c));
+        const subsChanged =
+          newSubs.length !== currentSubs.length ||
+          newSubs.some((s) => !currentSubs.includes(s));
+
+        if (classesChanged || subsChanged) {
           lecturersChanged = true;
-          return {
+          const updatedLec = {
             ...lec,
-            assignedSubjects: newSubs,
-            assignedClasses: newCls,
-            assignedSections: newCls
+            assignedSubjects: newSubs.length > 0 ? newSubs : currentSubs,
+            assignedClasses: newClasses,
+            assignedSections: newClasses
           };
+
+          if (
+            this.activeLecturer &&
+            (this.activeLecturer.id === lec.id ||
+              (this.activeLecturer.email && lec.email && this.activeLecturer.email.toLowerCase().trim() === lec.email.toLowerCase().trim()))
+          ) {
+            this.activeLecturer = {
+              ...this.activeLecturer,
+              assignedClasses: newClasses,
+              assignedSections: newClasses
+            };
+            this.saveActiveLecturerLocally();
+          }
+
+          return updatedLec;
         }
       }
       return lec;
@@ -2867,54 +2906,159 @@ class AttendanceEngine {
     });
     const cleanClasses = Array.from(cleanClassesMap.values());
 
-    // 1. Update subject.sections
-    const subIdx = this.subjects.findIndex((s) => s.code.toUpperCase() === normCode);
+    // 1. Locate subject with robust normalized code matching
+    const subIdx = this.subjects.findIndex(
+      (s) => (s.code || '').trim().toUpperCase().replace(/\s+/g, '') === normCode || s.id === `SUB-${normCode}`
+    );
+
+    const targetLecturer = lecturer || this.activeLecturer;
+    const lecId = targetLecturer?.id || 'UNKNOWN';
+    const lecName = targetLecturer?.name || 'Pensyarah';
+    const lecEmail = targetLecturer?.email || '';
+
+    // 2. Preserve other lecturers' classes for this subject in the course catalogue
+    const otherLecturersClasses = this.teachingAssignments
+      .filter((ta) => {
+        if (ta.status !== 'ACTIVE') return false;
+        const isSameSub = (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '') === normCode;
+        const isDifferentLecturer = targetLecturer
+          ? ta.lecturerId !== lecId &&
+            (!ta.lecturerEmail || !lecEmail || ta.lecturerEmail.toLowerCase().trim() !== lecEmail.toLowerCase().trim())
+          : false;
+        return isSameSub && isDifferentLecturer;
+      })
+      .map((ta) => toCanonicalClassCode(ta.className));
+
+    const allCombinedSubjectSections = Array.from(new Set([...otherLecturersClasses, ...cleanClasses]));
+
     if (subIdx >= 0) {
       this.subjects[subIdx] = {
         ...this.subjects[subIdx],
-        sections: cleanClasses
+        sections: allCombinedSubjectSections
       };
       this.saveSubject(this.subjects[subIdx]);
     }
 
-    // 2. Update teaching assignments for this subject & lecturer
-    const targetLecturer = lecturer || this.activeLecturer;
+    // 3. Update teaching assignments specifically for this subject & lecturer
     if (targetLecturer) {
-      const lecId = targetLecturer.id;
-      const lecName = targetLecturer.name;
-      const lecEmail = targetLecturer.email;
+      const matchThisLecturer = (ta: TeachingAssignment) => {
+        const isSameSub = (ta.subjectCode || '').trim().toUpperCase().replace(/\s+/g, '') === normCode;
+        const isSameLec =
+          ta.lecturerId === lecId ||
+          Boolean(ta.lecturerEmail && lecEmail && ta.lecturerEmail.toLowerCase().trim() === lecEmail.toLowerCase().trim()) ||
+          Boolean(ta.lecturerName && lecName && ta.lecturerName.toLowerCase().trim() === lecName.toLowerCase().trim());
+        return isSameSub && isSameLec;
+      };
 
-      // Keep teaching assignments for other subjects or other lecturers
-      const otherTas = this.teachingAssignments.filter(
-        (ta) =>
-          !(
-            ta.subjectCode?.toUpperCase() === normCode &&
-            (ta.lecturerId === lecId ||
-              (ta.lecturerEmail && ta.lecturerEmail.toLowerCase() === lecEmail.toLowerCase()) ||
-              (ta.lecturerName && ta.lecturerName.toLowerCase() === lecName.toLowerCase()))
-          )
+      const oldLecturerAssignments = this.teachingAssignments.filter(matchThisLecturer);
+
+      // Teaching assignments to delete (those unticked or removed)
+      const toDeleteAssignments = oldLecturerAssignments.filter(
+        (oldTa) => !cleanClasses.some((c) => normalizeClassCode(c) === normalizeClassCode(oldTa.className))
       );
 
-      // Create new active assignments for each selected class
-      const newTas: TeachingAssignment[] = cleanClasses.map((cls) => ({
-        id: `TA-${lecId}-${normCode}-${cls}`,
-        lecturerId: lecId,
-        lecturerName: lecName,
-        lecturerEmail: lecEmail,
-        subjectId: this.subjects[subIdx]?.id || `SUB-${normCode}`,
-        subjectCode: normCode,
-        subjectName: this.subjects[subIdx]?.name || normCode,
-        className: cls,
-        status: 'ACTIVE',
-        createdAt: new Date().toISOString()
-      }));
+      // Keep teaching assignments for other subjects or other lecturers
+      const otherTas = this.teachingAssignments.filter((ta) => !matchThisLecturer(ta));
+
+      // Create or update active assignments for each selected class
+      const newTas: TeachingAssignment[] = cleanClasses.map((cls) => {
+        const existing = oldLecturerAssignments.find((oldTa) => normalizeClassCode(oldTa.className) === normalizeClassCode(cls));
+        if (existing) {
+          return {
+            ...existing,
+            className: cls,
+            status: 'ACTIVE' as const
+          };
+        }
+        return {
+          id: `TA-${lecId}-${normCode}-${cls}`,
+          lecturerId: lecId,
+          lecturerName: lecName,
+          lecturerEmail: lecEmail,
+          subjectId: this.subjects[subIdx]?.id || `SUB-${normCode}`,
+          subjectCode: normCode,
+          subjectName: this.subjects[subIdx]?.name || normCode,
+          className: cls,
+          status: 'ACTIVE' as const,
+          createdAt: new Date().toISOString()
+        };
+      });
 
       this.teachingAssignments = [...otherTas, ...newTas];
       this.saveTeachingAssignmentsLocally();
 
+      // Update lecturer's assignedClasses / assignedSections
+      const lecturerIdx = this.lecturers.findIndex(
+        (l) => l.id === lecId || (l.email && lecEmail && l.email.toLowerCase().trim() === lecEmail.toLowerCase().trim())
+      );
+      if (lecturerIdx >= 0) {
+        const allLecClasses = Array.from(
+          new Set(
+            this.teachingAssignments
+              .filter(
+                (ta) =>
+                  ta.lecturerId === lecId ||
+                  (ta.lecturerEmail && lecEmail && ta.lecturerEmail.toLowerCase().trim() === lecEmail.toLowerCase().trim())
+              )
+              .map((ta) => toCanonicalClassCode(ta.className))
+          )
+        );
+        this.lecturers[lecturerIdx] = {
+          ...this.lecturers[lecturerIdx],
+          assignedClasses: allLecClasses,
+          assignedSections: allLecClasses
+        };
+        this.saveLecturersLocally();
+        if (
+          this.activeLecturer &&
+          (this.activeLecturer.id === lecId ||
+            (this.activeLecturer.email && lecEmail && this.activeLecturer.email.toLowerCase().trim() === lecEmail.toLowerCase().trim()))
+        ) {
+          this.activeLecturer = {
+            ...this.activeLecturer,
+            assignedClasses: allLecClasses,
+            assignedSections: allLecClasses
+          };
+          this.saveActiveLecturerLocally();
+        }
+        if (db) {
+          setDoc(doc(db, 'lecturers', this.lecturers[lecturerIdx].id), sanitizeForFirestore(this.lecturers[lecturerIdx]), { merge: true }).catch(console.warn);
+        }
+      }
+
+      // Update subject's sections to reflect active assignments across all lecturers for this subject
+      if (subIdx >= 0) {
+        const allActiveSubjClasses = Array.from(
+          new Set(
+            this.teachingAssignments
+              .filter(
+                (ta) =>
+                  (ta.status === 'ACTIVE' || !ta.status) &&
+                  (ta.subjectCode || '').trim().toUpperCase() === normCode
+              )
+              .map((ta) => toCanonicalClassCode(ta.className))
+          )
+        );
+        this.subjects[subIdx] = {
+          ...this.subjects[subIdx],
+          sections: allActiveSubjClasses
+        };
+        this.saveSubjectsLocally();
+        this.notifySubjectListeners();
+        if (db) {
+          setDoc(doc(db, 'subjects', this.subjects[subIdx].id), sanitizeForFirestore(this.subjects[subIdx]), { merge: true }).catch(console.warn);
+        }
+      }
+
+      // Atomically delete removed assignments and write new assignments in Firestore
       if (db) {
         try {
           const batch = writeBatch(db);
+          toDeleteAssignments.forEach((ta) => {
+            if (ta.id) {
+              batch.delete(doc(db, 'teaching_assignments', ta.id));
+            }
+          });
           newTas.forEach((ta) => {
             batch.set(doc(db, 'teaching_assignments', ta.id), sanitizeForFirestore(ta), { merge: true });
           });
